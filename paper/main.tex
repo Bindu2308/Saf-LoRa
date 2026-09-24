@@ -1,0 +1,660 @@
+\documentclass[journal]{IEEEtran}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage[boxed,linesnumbered,ruled]{algorithm2e}
+\usepackage{float}
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+
+\begin{document}
+
+\title{SAF-LoRa: State-Aware Feedback Scheduling for Split-Telegram LoRa Networks}
+
+\author{
+\IEEEauthorblockN{Author Name(s) -- TO BE FILLED IN}
+\IEEEauthorblockA{Department / Institute -- TO BE FILLED IN}
+}
+
+\maketitle
+
+\begin{abstract}
+Cooperative multi-gateway reception is widely assumed to improve LoRa reliability by letting a receiver weigh which gateway's report to trust more. We show this assumption fails under commodity hard-decision reception, where only CRC-valid fragments enter telegram reconstruction (CRC-failed receptions may still be forwarded for interference-state estimation): we establish analytically, and verify by simulation (zero strategy-outcome mismatches across 10--60 simulated nodes and an independent 10{,}000-observation implementation check), that reliability-based selection among duplicate valid observations cannot improve reconstruction availability, since availability depends only on the set of unique fragment indices received. We relocate state awareness to a decision it can influence instead: which gateway should carry a rationed downlink acknowledgment under a duty-cycle-constrained feedback budget. On a ten-node, two-gateway commodity ESP32 testbed, state-aware scheduling matched round-robin's gateway share under symmetric conditions (50.6\% vs.\ 50.6\%) but redirected acknowledgments toward the unaffected gateway under controlled asymmetric interference (57.2\% $\pm$ 2.1\%, $n=3$, a 6.6-percentage-point shift) -- a demonstrated change in gateway-selection \emph{behavior}, not yet an established improvement in end-to-end reconstruction rate under matched non-learning baselines, which remains future work. A discrete-event simulation reproduces a comparable-magnitude shift (44.1\% $\pm$ 9.3\%, $n=15$) and verifies HMM state classification against simulated ground truth (87.3\%) where the hardware campaign's own interference log could not be time-aligned. As supporting evidence, a Gradient Boosting classifier using HMM belief achieves 95.2\% telegram-grouped accuracy (17{,}174 identifiable observations, leakage-audited), and uplink belief predicts downlink delivery with AUC~=~0.619, reported as observational evidence rather than a controlled predictive validation. We also report two null/negative results without omitting them: a feedback-budget sweep across a 50$\times$ range with no clear monotonic trend, and a Temporal Graph Attention Network that did not clear a majority-class baseline under leakage-free evaluation. A decentralized EXP3-style timing mechanism (D-FRAG) is implemented and exercised using reconstruction-outcome feedback but not yet validated against non-learning baselines. Together, these results delineate where state information can and cannot influence a commodity-hardware split-telegram LoRa system.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LoRa, LPWAN, cooperative reception, feedback scheduling, duty cycle, Gilbert-Elliott channel, Hidden Markov Model, EXP3, Reed-Solomon erasure coding, telegram splitting
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Low-Power Wide-Area Networks (LPWANs) have become foundational to large-scale Internet of Things (IoT) deployments, offering long communication range and low energy consumption at the cost of limited data rates and bandwidth. Among LPWAN technologies, LoRa has emerged as a widely adopted choice for sensor networks, smart agriculture, industrial monitoring, and environmental sensing, owing to its low-cost commodity hardware and operation in license-exempt ISM/SRD bands \cite{ts2014}. As such deployments scale to dense, multi-node networks, reliable message delivery becomes increasingly difficult in the presence of interference, fading, and channel contention. Single-gateway LoRa reception is fundamentally limited: a gateway experiencing a transient burst of interference has no means of recovering a lost transmission, even when a neighboring gateway may have received the same message cleanly.
+
+Cooperative reception, wherein multiple spatially distributed gateways jointly recover a transmitted message, offers a natural path to improving reliability without modifying the underlying LoRa physical layer \cite{gw2022, pcube2021}. A natural intuition is that a receiver which reasons about which gateway's report is currently more trustworthy should outperform one that treats every observation identically. We show that under the hard-decision reception model exposed by commodity LoRa transceivers, this intuition does not hold: once a fragment has passed CRC, weighting one valid copy over another cannot change whether the underlying erasure code has enough unique fragments to decode. This is not a tuning failure -- it is a structural property of the combining rule.
+
+Having established where state-aware reasoning \emph{cannot} help, we ask where it can. We identify the downlink acknowledgment path as such a location: duty-cycle constraints can bound how many acknowledgments a gateway may transmit, creating a potential feedback-budget constraint at scale, so when acknowledgments must be rationed, \emph{which} node-gateway pair receives one is a genuine decision that link-reliability information can improve. This reframing is the core contribution of this work.
+
+\textit{Illustrative scenario.} Consider a factory floor where battery-powered vibration sensors report to two ceiling-mounted gateways. A conveyor motor near one gateway produces intermittent electromagnetic interference during operating cycles, degrading that gateway's reception while the other, farther from the motor, remains largely unaffected. A cooperative receiver that is unaware of this asymmetry cannot exploit it when reconstruction is already union-based (Section~III); a receiver that is aware of it, however, can preferentially route acknowledgments through the unaffected gateway when the acknowledgment budget is scarce. This scenario -- illustrative rather than experimentally reproduced with a motor-grade interference source -- motivates the architecture developed in this paper; our controlled-interference hardware experiment (Section~V-D) reproduces the same asymmetric-degradation structure under a scripted source.
+
+
+
+
+\subsection{Contributions}
+
+\textit{Contribution 1 -- fundamental limitation.} We establish analytically (Proposition~1) and verify computationally through discrete-event simulation (Section~\ref{sec:results-sim}, zero strategy-outcome mismatches across 10--60 simulated nodes and 10 random seeds each) that under hard-decision commodity reception, reliability-based selection among CRC-valid duplicate fragments cannot improve telegram-level reconstruction availability.
+
+\textit{Contribution 2 -- state-aware scheduling.} Motivated by Contribution~1, we relocate state awareness to a decision it can influence: which gateway should carry a rationed downlink acknowledgment. We implement a five-policy scheduler (Section~\ref{sec:scheduling}) in which the state-aware policy's gateway choice is informed by interference-state belief.
+\textit{Contribution 3 -- hardware demonstration.} On a ten-node, two-gateway commodity ESP32 testbed, we show that state-aware scheduling changes gateway-selection behavior in response to controlled asymmetric interference (57.2\% vs.\ 50.6\% gateway share, Section~V), and reproduce comparable-magnitude behavior in a discrete-event simulation at a severity level selected to produce a comparable gateway-share displacement.
+
+\textit{Contribution 4 -- supporting validation.} An HMM--Gradient Boosting link-reliability estimator evaluated under grouped splits on an identifiable subset of 17{,}174 observations from a 27{,}156-observation dataset (95.2\% telegram-grouped, 95.8\% node-grouped accuracy); an AUC~=~0.619 observational premise analysis that uplink belief is associated with downlink delivery; and D-FRAG, a decentralized EXP3-based timing policy exercised using reconstruction-outcome feedback delivered through the acknowledgment path. This estimator is an auxiliary link-reliability analysis supporting the premise behind the scheduler's belief signal; the scheduler itself ranks gateways using HMM belief, not the Gradient Boosting output.
+
+\textit{Contribution 5 -- negative and null findings.} A null feedback-budget sweep showing no clear monotonic reconstruction-rate trend across a 50$\times$ duty-cycle range; D-FRAG reported as implemented and exercised but not validated against non-learning baselines; and a Temporal Graph Attention Network (TGAT) alternative that did not clear a majority-class baseline under leakage-free evaluation (Appendix~\ref{app:tgat}).
+
+\section{Related Work}
+
+Telegram splitting -- dividing a message into fragments transmitted with time diversity -- was introduced to improve reliability against bursty interference on shared ISM/SRD bands \cite{ts2014, ts2015}. Subsequent work characterized its performance under specific collision models \cite{ts2016} and proposed detectors adapted to bursty interference \cite{ts2020}. Most recently, fragment-level macro-diversity reception across multiple gateways has been proposed for LR-FHSS LoRaWAN \cite{ts2025}, closely related to the split-telegram, multi-gateway setting studied here.
+
+Cooperative multi-gateway reception has been explored from several angles. Petroni and Biagi study interference mitigation and decoding through gateway diversity \cite{gw2022}. Mikhaylov et al.\ provide an experimental study of multi-gateway LoRaWAN deployments \cite{gw2020exp}, and Citoni et al.\ examine the impact of inter-gateway distance on performance \cite{gw2021dist}. Loubany et al.\ address spreading-factor selection \cite{gw2020sf} and joint throughput-energy optimization \cite{gw2023energy, gw2023throughput} in multi-gateway settings. PCube demonstrates scaling concurrent transmissions through reception diversity \cite{pcube2021}.
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=1.60\columnwidth]{architecture.png}
+    \caption{System architecture of the proposed framework. Ten LoRa nodes
+    generate $(5,3)$ Reed--Solomon coded telegrams with $F=5$ fragments.
+    The Raspberry Pi 4 performs gateway selection and acknowledgment
+    scheduling. The selected gateway transmits an ACK/NACK, and the
+    transmitting node adapts its timing using D-FRAG/EXP3 based on the
+    feedback.}
+    \label{fig:system_architecture}
+\end{figure*} 
+A separate line of work targets physical-layer concurrent-transmission decoding: Mc-LoRa enables concurrency for non-orthogonal channels \cite{mclora2023}; SIGCOMM-level concurrent interference cancellation decodes multi-packet collisions directly \cite{sic2021sigcomm}; Garlisi et al.\ study interference cancellation's impact on network capacity \cite{sic2021iotj}; and a two-user successive-interference-cancellation receiver with soft-decoding is presented in \cite{sic2021letters}. NELoRa applies neural demodulation to recover ultra-low-SNR signals \cite{nelora2021}; SRLoRa extends this to multi-gateway super-resolution decoding \cite{srlora2023}. Pyramid tracks concurrent LoRa transmissions in real time via peak tracking \cite{pyramid2024}. Canas resolves inter-logical-channel interference for large-scale deployments \cite{canas2026}. LLDPC introduces a low-density parity-check coding scheme tailored to LoRa's channel characteristics \cite{lldpc2022}.
+
+Machine learning has been applied to LoRa reception reliability estimation \cite{takyu2022} and to localization \cite{loraloc2020}. These works, like ours, use learned models to inform decisions at the receiver; our contribution differs in identifying \emph{which} decision -- fragment combining or acknowledgment scheduling -- such a model can actually influence under hard-decision commodity hardware.
+
+\begin{table}[t]
+\caption{Qualitative comparison with representative related work. This is a feature comparison based on each work's own stated scope, not a quantitative performance benchmark; no head-to-head experiment against these systems was run.}
+\label{tab:related-work-comparison}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{1.7cm}p{1.6cm}p{1.5cm}p{2.5cm}@{}}
+\toprule
+\textbf{Work} & \textbf{Reception model} & \textbf{Evaluation} & \textbf{Cooperation focus} \\
+\midrule
+mioty (TS-UNB) \cite{mioty2018} & Commodity, hard-decision & Standard spec. & Single-base-station reconstruction; no multi-gateway ACK scheduling \\
+Petroni \& Biagi \cite{gw2022} & Commodity & -- & Interference mitigation via gateway diversity \\
+PCube \cite{pcube2021} & Commodity, hard-decision & Hardware & Concurrent-transmission reception diversity \\
+NELoRa \cite{nelora2021} & SDR, soft-decision & Hardware & Single-gateway neural demodulation \\
+SRLoRa \cite{srlora2023} & SDR, soft-decision & Hardware & Multi-gateway neural signal combining \\
+Lahoud \& Khawam \cite{ts2025} & Commodity, hard-decision & Analytical (stochastic geometry) & Fragment-level macro-diversity reception for LR-FHSS \\
+\textbf{This work} & Commodity, hard-decision & Hardware + simulation & Shows fragment selection is futile; relocates state awareness to downlink ACK scheduling \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textit{Relation to mioty.} Telegram splitting, the fragmentation technique underlying this work, also underlies mioty\textsuperscript{\textregistered}, standardized as ETSI TS 103 357 (TS-UNB) \cite{mioty2018}. mioty's published architecture describes single-base-station reconstruction; the multi-gateway acknowledgment-scheduling problem addressed here is, to our knowledge, not described in its public documentation, though we do not claim a comprehensive comparison against its full specification or licensed implementations.
+
+\textit{Research gap.} Existing work considers multi-gateway diversity, learned reliability estimation, or advanced physical-layer decoding, but does not establish the fundamental limitation that CRC-gated commodity receivers impose on reliability-weighted duplicate-fragment selection, nor does it relocate state-aware decision-making to the constrained downlink feedback-scheduling problem that arises once cooperative reception is deployed. This is the gap addressed here.
+
+\textit{Synthesis.} Much of the surveyed work either (i) proposes physical-layer techniques requiring soft-decision or SDR-capable receivers, incurring deployment cost and complexity beyond commodity transceivers, or (ii) proposes higher-layer cooperative or learned combining schemes without explicitly distinguishing hard-decision fragment selection from soft-decision recovery. This work explicitly examines that question, shows the answer is negative for fragment combining, and identifies a downlink scheduling decision where the same state information demonstrably influences gateway selection.
+
+\section{System Model}
+
+\subsection{Network and Reconstruction Model}
+Consider $N$ transmitter nodes, indexed $n = 1, \ldots, N$, each generating telegrams encoded with a systematic $(F, K)$ Reed--Solomon erasure code over $\mathrm{GF}(2^8)$, comprising $K$ information fragments and $F-K$ parity fragments: each telegram is split into $F$ fragments, any $K$ of which suffice for reconstruction. Two gateways, indexed $g \in \{1, 2\}$, independently attempt reception of each transmitted fragment. A gateway exposes a fragment to the reconstruction process only if it passes CRC; fragments that fail CRC are not part of the observation model available to the server for reconstruction purposes, though such CRC-failed receptions may still be forwarded as physical-layer observations for a different purpose (see Section~\ref{sec:crc-fail}).
+
+Let $r^g_{n,t,i} \in \{0,1\}$ indicate whether gateway $g$ successfully (CRC-valid) received fragment $i$ of telegram $t$ from node $n$. The server's view of received fragments is the union across gateways:
+\begin{equation}
+R_{n,t} = \bigcup_{g} \{\, i : r^g_{n,t,i} = 1 \,\}.
+\end{equation}
+Reconstruction succeeds if and only if $|R_{n,t}| \geq K$. In all experiments reported in this paper, the erasure code is instantiated as a systematic $(5,3)$ Reed--Solomon code over $\mathrm{GF}(2^8)$, i.e., $F=5$ and $K=3$; this specific $(F,K)$ pair is used throughout the implementation (Section~\ref{sec:implementation}) and evaluation (Section~V) unless otherwise noted.
+
+\subsection{Proposition 1: Reliability-Based Selection Among CRC-Valid Duplicates Cannot Improve Reconstruction Availability}
+\textbf{Statement.} Under the reception model above, any rule that selects among multiple CRC-valid copies of the same fragment index $i$ (e.g., preferring gateway 1's copy over gateway 2's copy based on an estimated reliability score) leaves $R_{n,t}$, and therefore telegram-level reconstruction success, unchanged.
+
+\textit{Proof.} $R_{n,t}$ is defined as a set of fragment indices, not a set of (fragment, gateway) pairs. If both $r^1_{n,t,i} = 1$ and $r^2_{n,t,i} = 1$, index $i$ is already a member of $R_{n,t}$ regardless of which gateway's copy is nominally ``selected.'' Any combining rule that only chooses among already-valid duplicates therefore computes a function of $R_{n,t}$ that is identical to the trivial full-union rule. $\blacksquare$
+
+This proposition applies to selection among already CRC-valid duplicate observations under hard-decision reception; it does not apply to soft-decision receivers in which an otherwise CRC-invalid or undecoded observation can contribute probabilistic information toward fragment recovery.
+
+Throughout this paper, we therefore distinguish \emph{selection} -- choosing which already-valid copy of a duplicate fragment to retain, which Proposition~1 shows cannot affect availability -- from \emph{combining} in the soft-decision sense, where continuous reliability estimates could in principle change which fragments are judged recoverable at all. Both the hardware system and the discrete-event combining simulation (Section~\ref{sec:sim}) perform only the former, under an identical CRC gate; Section~\ref{sec:results-sim} confirms this empirically.
+
+This motivates relocating state awareness to a decision it can influence: which gateway should carry the downlink acknowledgment for a given telegram, under a duty-cycle constraint that makes acknowledging every telegram through every gateway infeasible at scale (Section~\ref{sec:scheduling}).
+
+\subsection{Reliability Score Interpretation}
+\textbf{Statement.} The Gradient Boosting reliability score $R_i$ for observation $i$ is used for empirical ranking of gateway observations; we do not interpret the score as a calibrated probability. Consequently, comparisons of the form $R_i > R_j$ are meaningful for ranking purposes even though $R_i$ and $R_j$ are not asserted to be well-calibrated probabilities of correct decoding.
+
+\subsection{Proposition 2: Acknowledged-Node Capacity Under Duty Cycle}
+\label{prop:capacity}
+\textbf{Statement.} Let $\mathcal{D}_g$ denote a gateway's duty-cycle allowance, $\mathcal{D}_{\text{node}}$ a node's allowance, $\tau_{\text{frag}}$ the airtime of one uplink fragment, and $\tau_{\text{ack}}$ the airtime of one downlink acknowledgment. A node transmitting $F$ fragments per telegram at its own duty-cycle limit has a minimum admissible telegram period $T_{\min} = F\tau_{\text{frag}}/\mathcal{D}_{\text{node}}$. At that period, the number of nodes a single gateway can individually acknowledge is
+\begin{equation}
+N_{\max} = \left\lfloor F \cdot \frac{\mathcal{D}_g}{\mathcal{D}_{\text{node}}} \cdot \frac{\tau_{\text{frag}}}{\tau_{\text{ack}}} \right\rfloor .
+\label{eq:nmax}
+\end{equation}
+
+\textit{Proof sketch.} Within one telegram period $T_{\min}$, a gateway may transmit for at most $\mathcal{D}_g T_{\min}$ seconds. Each acknowledgment consumes $\tau_{\text{ack}}$, so at most $\lfloor \mathcal{D}_g T_{\min}/\tau_{\text{ack}} \rfloor$ nodes can be served. Substituting $T_{\min}$ yields~\eqref{eq:nmax}. \hfill$\blacksquare$
+
+\textit{Remark.} When the uplink fragment and acknowledgment have identical airtime (accounting jointly for spreading factor, coding rate, header mode, preamble length, and payload length), $\tau_{\text{frag}} = \tau_{\text{ack}}$ and the ratio cancels, leaving $N_{\max} = \lfloor F \mathcal{D}_g / \mathcal{D}_{\text{node}} \rfloor$.
+
+For our deployment (illustrative duty-cycle budget parameters, not asserted to represent the generic regulatory limit for the 868~MHz band -- the exact permitted duty cycle depends on the specific sub-band and access mechanism under ETSI EN 300 220-2 \cite{etsi_en300220_2} -- adopted here as $F=5$, $\mathcal{D}_g=10\%$, $\mathcal{D}_{\text{node}}=2.5\%$, $\tau_{\text{frag}}=\tau_{\text{ack}}=46.34$~ms at SF7/BW125, CR4/5, 8-symbol preamble, 15-byte implicit-header payload with CRC enabled -- verified against the standard LoRa airtime formula \cite{semtech_an1200_13}, which gives $T_{\text{packet}} = 46.336$~ms for these parameters, matching to within rounding), $T_{\min} = 9.27$~s and $N_{\max} = 20$. At the measured mean telegram period of 24.7~s, the ceiling rises to 53 nodes; under these illustrative parameters, the ten-node testbed corresponds to approximately 19\% of the calculated acknowledgment-capacity ceiling. We make no claim of proximity to any regulatory limit.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g15_ack_capacity_vs_period.png}
+\caption{Acknowledgment-capacity ceiling $N_{\max}$ as a function of telegram period, under the illustrative duty-cycle parameters; the ten-node testbed sits well below the ceiling at both the minimum-admissible and measured periods.}
+\label{fig:ack-capacity}
+\end{figure}
+
+We further note that this $\mathcal{D}_{\text{node}}=2.5\%$ figure is used only for the illustrative capacity calculation above and is a separate parameterization from the D-FRAG node-timing budget described in Section~\ref{sec:dfrag}; the two should not be read as jointly describing a single deployment's duty-cycle compliance.
+
+For the commodity hardware receiver, the general combining abstraction above reduces to hard-decision fragment collection, because only CRC-valid fragments are exposed to the server; a continuous-observation reception model, where reliability estimates are derived from SNR before a CRC gate is applied, is instantiated only in the discrete-event simulation environment described next; the CRC gate itself, and therefore the resulting reconstruction rule, is identical to hardware's.
+
+\section{Implementation}
+\label{sec:implementation}
+
+
+\subsection{Hardware Platform}
+The testbed comprises ten transmitter nodes built from ESP32 microcontrollers: seven paired with SX1262 and three with SX1276 LoRa transceivers (selected according to hardware availability; both were configured with the same nominal LoRa parameters and application-layer protocol; no model-specific performance comparison is attempted, and the two radio families are treated as commodity LoRa transmitters implementing the same configured PHY parameters), two ESP32+SX1262 cooperative gateways, and a Raspberry Pi 4 network server. All radios operate at 868~MHz, SF7, BW125~kHz, CR4/5, with a fixed 15-byte implicit-header packet length used for both uplink fragments and downlink acknowledgments (the latter zero-padded from 7 meaningful bytes, since implicit-header mode requires both sides to agree on a fixed length that is never transmitted over the air).
+
+\subsection{Fragment and Acknowledgment Wire Format}
+Each 15-byte fragment carries: node ID (1B), telegram ID (4B), fragment ID (1B), total fragment count (1B, equal to $F=5$ throughout this deployment; Section~III-A), and an 8-byte MDS-encoded payload. Downlink acknowledgments carry a magic byte, node ID, telegram ID, and a success flag in 7 meaningful bytes.
+
+\subsection{CRC-Failed Observation Forwarding}
+\label{sec:crc-fail}
+Gateways forward CRC-failed receptions to the server (flagged accordingly), in addition to CRC-valid fragments. A CRC failure is itself evidence that a link is currently degraded; forwarding it allows the HMM interference-state estimator to update on this signal even though the corrupted payload itself is never used for reconstruction. Node/fragment identifiers extracted from a CRC-failed packet are unreliable (they are covered by the same failed CRC), so these observations update only the per-gateway belief and are excluded from telegram association. Specifically, only receiver-local physical-layer measurements -- SNR, RSSI, and timestamp -- are retained from a CRC-failed packet for HMM updating; packet-header fields are not used for association. As described in Section~\ref{sec:hmm}, this per-gateway belief in turn seeds the per-(node, gateway) belief for any node lacking recent CRC-valid observations of its own.
+
+\subsection{HMM Interference-State Estimation}
+\label{sec:hmm}
+A two-state Hidden Markov Model estimates $\hat{p}(t) = P(S(t) = \text{GOOD} \mid o_{1:t})$, the exact filtering posterior under the assumed model, from incoming SNR observations. The model is maintained per gateway and refined to per-(node, gateway) granularity whenever an observation's node identity is trusted. CRC-valid fragments carry a trusted node ID and update the corresponding per-(node, gateway) belief directly; CRC-failed packets, whose node ID cannot be trusted (Section~\ref{sec:crc-fail}), update only the per-gateway belief, which serves as the prior for any (node, gateway) pair without its own recent CRC-valid history. Transition and emission parameters are configured offline from characteristic values (Table~\ref{tab:hmm-params}), fixed before the evaluation campaign and not re-estimated from the evaluation records; the state belief itself is updated online.
+
+\begin{table}[t]
+\caption{HMM Emission and Transition Parameters}
+\label{tab:hmm-params}
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+$P(\text{GOOD}\to\text{GOOD})$ & 0.85 \\
+$P(\text{BAD}\to\text{BAD})$ & 0.60 \\
+$\mu_{\text{GOOD}}$ (SNR, dB) & 12.5 \\
+$\sigma_{\text{GOOD}}$ (SNR, dB) & 1.5 \\
+$\mu_{\text{BAD}}$ (SNR, dB) & 5.0 \\
+$\sigma_{\text{BAD}}$ (SNR, dB) & 4.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Gradient Boosting Reliability Estimation}
+A Gradient Boosting classifier (100 estimators, max depth 3, learning rate 0.1) is trained offline on five features per (telegram, gateway) observation: mean SNR, minimum SNR, mean RSSI, HMM belief at telegram start, and historical success rate for that (node, gateway) pair, computed as
+\begin{equation}
+h_g^n(t) = \frac{\text{successful observations from } (n,g) \text{ before } t}{\text{all observations from } (n,g) \text{ before } t},
+\end{equation}
+strictly from telegrams prior to $t$ (with $h_g^n(t)=0.5$ absent prior history), so that telegram $t$ never contributes to its own feature value. The classifier is deployed as a static model; it is prone, as gradient-boosted models generally are, to overconfident probability estimates near 0 and 1, and its raw output is used for relative ranking (see Section~IV) rather than interpreted as a calibrated probability. We emphasize that this classifier is an auxiliary link-reliability analysis supporting the AUC-based premise analysis of Section~\ref{sec:results-premise}; the scheduling mechanism of Section~\ref{sec:scheduling} ranks gateways using HMM belief directly and does not consume the Gradient Boosting output.
+
+\subsection{D-FRAG: Decentralized Timing Adaptation}
+\label{sec:dfrag}
+Each node runs an EXP3 bandit over four timing configurations (Table~\ref{tab:dfrag-actions}, Algorithm~\ref{alg:dfrag}), updated using a delayed reward signal from downlink acknowledgment feedback (mean delay approximately 3~s, reflecting the LoRa half-duplex acknowledgment path).
+
+\begin{algorithm}[!t]
+\caption{D-FRAG: Node-Side EXP3 Timing Selection}
+\label{alg:dfrag}
+\SetAlgoLined
+\KwIn{Action set $A = \{a_1,\ldots,a_4\}$ (Table~\ref{tab:dfrag-actions}), exploration rate $\gamma = 0.1$}
+\KwOut{Selected timing action for the next telegram}
+Initialize weights $w_i \leftarrow 1$ for all $i \in \{1,\ldots,4\}$\;
+\While{transmitting}{
+    $W \leftarrow \sum_i w_i$\;
+    \For{$i \leftarrow 1$ \KwTo $4$}{
+        $p_i \leftarrow (1-\gamma)\dfrac{w_i}{W} + \dfrac{\gamma}{4}$\;
+    }
+    Sample action $a_j$ according to distribution $p$\;
+    Transmit telegram using timing configuration $a_j$\;
+    Wait up to ACK\_TIMEOUT\_MS for a response\;
+    \eIf{a response (ACK or NACK) was received}{
+        $r \leftarrow 1$ if success, else $0$\;
+        $\hat{r} \leftarrow r / p_j$\;
+        $w_j \leftarrow w_j \cdot \exp(\gamma \hat{r} / 4)$\;
+    }{
+        \tcp{Timeout: no update -- silence carries no}
+        \tcp{information about the chosen action's quality.}
+    }
+}
+\end{algorithm}
+
+\begin{table}[t]
+\caption{D-FRAG Action Set}
+\label{tab:dfrag-actions}
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+Action & Mean delay & Jitter range \\
+\midrule
+$a_1$ & 4.0 s & $\pm$0.5 s \\
+$a_2$ & 5.0 s & $\pm$1.0 s \\
+$a_3$ & 6.0 s & $\pm$1.5 s \\
+$a_4$ & 7.0 s & $\pm$2.0 s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The server-side 3~s pacing delay (Section~IV) is a fixed, D-FRAG-independent wait applied before relaying any acknowledgment, ensuring the transmitting node has finished sending all fragments of the current telegram before an ACK arrives; it is distinct from the mean delay values above, which are the node's own inter-telegram transmission timing, selected by the bandit itself. The bandit updates its weights \emph{only} when an explicit acknowledgment or negative acknowledgment is received. Timeouts are treated as censored feedback rather than zero-reward observations, because the absence of a response does not distinguish a failed uplink transmission from an unsent or budget-exhausted acknowledgment; scoring silence as failure would therefore inject noise unrelated to the timing action actually chosen. Because timeout observations are censored rather than scored as zero-reward, D-FRAG departs from the reward model standard EXP3 regret bounds assume; we report D-FRAG as a censored-feedback EXP3-style mechanism and do not claim its guarantees transfer unmodified.
+
+We note that the four D-FRAG timing configurations above (4.0--7.0~s mean delay) are shorter than the $T_{\min}=9.27$~s minimum admissible telegram period derived under the illustrative duty-cycle parameters of Proposition~2 ($\mathcal{D}_{\text{node}}=2.5\%$; five 46.34~ms fragments at a 4.0~s period correspond to an instantaneous node duty cycle of approximately 5.8\%). This is not an oversight: the D-FRAG timing budget in Table~\ref{tab:dfrag-actions} was configured against the testbed's own bench-evaluation airtime allowance, a separate parameterization from the illustrative $\mathcal{D}_{\text{node}}=2.5\%$ figure used solely to derive the acknowledgment-capacity bound in Proposition~2. The two parameterizations are not intended to jointly describe one deployment's duty-cycle compliance, and we make no claim that the bench testbed as configured satisfies the illustrative figure used in Proposition~2.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g14_dfrag_duty_cycle_check.png}
+\caption{Implied node duty cycle for each D-FRAG timing action against the illustrative $\mathcal{D}_{\text{node}}=2.5\%$ parameter used in Proposition~2; the two are independent parameterizations (see discussion above).}
+\label{fig:dfrag-duty-cycle}
+\end{figure}
+
+\subsection{State-Aware Feedback Scheduling}
+\label{sec:scheduling}
+Given a per-gateway duty-cycle budget enforced via a rolling airtime window, the network server selects, for each telegram requiring acknowledgment, which gateway(s) should transmit the downlink acknowledgment. Five policies are implemented and compared:
+\begin{itemize}
+\item \textbf{Broadcast}: both gateways transmit (the pre-scheduling baseline; costs twice the downlink airtime per acknowledgment).
+\item \textbf{Random}: uniform choice among gateways with available budget.
+\item \textbf{Round-robin}: deterministic per-node alternation.
+\item \textbf{Belief-only}: selects the gateway using the current uplink-primed belief, with no independent downlink-outcome tracking. An outcome-updated EWMA baseline was not implementable because confirmed downlink delivery observations were unavailable. In simulation (Section~V-I), this baseline converges with the state-aware policy because both are driven by the same uplink-primed prior. On hardware, however, the two did \emph{not} converge (61.3\% vs.\ 50.6\% GW1 share, Table~\ref{tab:policy-clean}); we attribute this to the hardware belief-only policy receiving no uplink-prior seeding on ties, unlike the state-aware policy, so its tie-breaking behavior differed in practice. The reported hardware difference should therefore not be read as a policy-level performance difference between belief-only and state-aware reasoning: it reflects that the two implementations did not use identical tie-seeding behavior, not a discovery that the two policies are fundamentally distinct. This discrepancy between the simulated and hardware convergence behavior is itself a finding worth further investigation, not one we have fully explained.
+\item \textbf{State-aware}: selects the gateway with the highest belief score, seeded from uplink HMM state when no downlink observation history exists. In the present implementation, since no downlink receipt observations exist, this reduces to $g^* = \arg\max_g \hat{p}_g$ using only the uplink-primed belief; the name reflects the intended architecture's use of interference-state information, not a currently-implemented closed-loop downlink learning capability.
+\end{itemize}
+
+\begin{algorithm}[!t]
+\caption{Server-Side State-Aware Downlink Scheduling}
+\label{alg:scheduler}
+\SetAlgoLined
+\KwIn{Node $n$, telegram outcome, available gateways $\mathcal{G}$, per-gateway airtime budget}
+\KwOut{Set of gateways to transmit the acknowledgment through}
+$\mathcal{A} \leftarrow \{g \in \mathcal{G} : \text{budget}(g) \text{ not exhausted}\}$\;
+\If{$\mathcal{A} = \emptyset$}{
+    \Return $\emptyset$ \tcp*{no acknowledgment sent this round}
+}
+\Switch{policy}{
+    \Case{broadcast}{$\text{chosen} \leftarrow \mathcal{A}$\;}
+    \Case{random}{$\text{chosen} \leftarrow \{\text{uniform random } g \in \mathcal{A}\}$\;}
+    \Case{round-robin}{$\text{chosen} \leftarrow \{\mathcal{A}[i \bmod |\mathcal{A}|]\}$ for node $n$'s counter $i$\;}
+    \Case{belief-only}{$\text{chosen} \leftarrow \{\arg\max_{g \in \mathcal{A}} \text{belief}(n,g)\}$, ties broken uniformly at random\;}
+    \Case{state-aware}{$\text{chosen} \leftarrow \{\arg\max_{g \in \mathcal{A}} \text{belief}(n,g,\text{uplink\_prior}(n,g))\}$, ties broken uniformly at random\;}
+}
+\ForEach{$g \in \text{chosen}$}{
+    Record airtime usage for $g$\;
+}
+\Return chosen\;
+\end{algorithm}
+
+Ties are broken uniformly at random; an earlier implementation using Python's \texttt{max()} was found to collapse deterministically onto the lowest-indexed gateway whenever beliefs were equal, producing a spurious 352-to-0 gateway split in an initial hardware run. This was identified and corrected prior to the reported campaign.
+
+Because nodes do not report acknowledgment receipt upstream in the current implementation, the downlink belief is primed from uplink interference state (justified by the AUC = 0.619 observational premise analysis, Section~\ref{sec:results-premise}) and does not learn from confirmed delivery outcomes; a successful \texttt{send\_downlink()} call reports a TCP write to the gateway, not a confirmed radio transmission or node-side reception. The two feedback loops in this architecture therefore differ: the node-side D-FRAG timing controller (Section~\ref{sec:dfrag}) does receive genuine ACK/NACK responses over the LoRa radio link and updates on them, whereas the server-side gateway-selection belief remains uplink-primed and does not close this loop, because node-side ACK-receipt confirmations are not currently reported back to the server.
+
+\subsection{Discrete-Event Simulation}
+\label{sec:sim}
+A Python discrete-event simulator uses an independent per-link Gilbert-Elliott channel model to generate continuous SNR-derived observations, intended to emulate the statistics of the continuous SNR readings the real receiver observes. A CRC gate, applied identically to the hardware receiver's behavior, then converts each observation to a binary CRC-valid/invalid outcome before any combining or scheduling logic runs: an observation contributes to a telegram's fragment-availability set only if it is CRC-valid, regardless of which combining strategy is nominally being evaluated. This ensures the simulation's reconstruction decision is mechanically identical to hardware's, per Proposition~1, rather than a separate soft-decision idealization.
+
+For the scheduling-mechanism study (Section~\ref{sec:results-sched}), the simulator is separately extended with the identical five-policy scheduler described in Section~\ref{sec:scheduling}, driven by the same Gilbert-Elliott channel and HMM belief model, so that the simulated scheduling mechanism implements the same scheduling logic as the hardware-validated mechanism (the simulator is Python, while the hardware runs ESP32 firmware and a Raspberry Pi server; the two are not literally the same codebase, but the decision policy is identical). This scheduling belief remains continuous-valued by design -- it is a link-quality estimate informing which gateway receives a rationed acknowledgment, not a fragment-validity decision, and is therefore unaffected by the CRC gate.
+
+\section{Performance Evaluation}
+
+\subsection{Experimental Design Overview}
+Table~\ref{tab:exp_design} summarizes the experiments reported. Hardware deployments were staged: a 3-node baseline (timeout characterization), a 10-node contention experiment, and the full 10-node deployment used for the ML pipeline and scheduling campaign. The discrete-event combining verification sweeps 10--60 nodes across 10 random seeds each; the discrete-event scheduling simulation uses a fixed 10-node topology across repeated random seeds.
+
+\begin{table}[t]
+\caption{Summary of Experimental Design}
+\label{tab:exp_design}
+\centering
+\footnotesize
+\begin{tabular}{|p{2.0cm}|p{1.5cm}|c|p{2.2cm}|}
+\hline
+\textbf{Experiment} & \textbf{Scale} & \textbf{Reps} & \textbf{Purpose} \\
+\hline
+HW timeout baseline & 3 nodes & 1 & Timeout-rate reference \\
+\hline
+HW contention & 10 nodes & 1 & Timeout scaling \\
+\hline
+HW full pipeline & 10 nodes & 1 & ML training data \\
+\hline
+HW policy comparison & 10 nodes & 2 & Gateway-share by policy \\
+\hline
+HW budget sweep & 10 nodes & 6 duty limits & Reconstruction vs.\ budget \\
+\hline
+HW interference response & 10 nodes & 3 & Scheduling under controlled interference \\
+\hline
+Hard-decision combining sweep & 10--60 nodes & 10 seeds/config & Strategy-invariance verification \\
+\hline
+Sim.\ scheduling sweep & 10 nodes & 15 seeds & Severity response, HMM verification \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Hardware Reconstruction Reliability}
+Across the campaign's measurement windows, the system reconstructed telegrams at 79.7\% $\pm$ 2.4\% (mean $\pm$ SD, $n=10$ eight-minute runs across five policies and two repetitions), with per-node reconstruction rates ranging 76--85\% across the ten deployed nodes (exact per-node values are not separately retained in the campaign logs, so only the aggregate mean, SD, and range are reported here). This aggregate characterizes the testbed's baseline operating point; the principal scheduling experiments below evaluate gateway-selection response to interference, not an improvement in this reconstruction rate. At 3 nodes, timeout rate was approximately 4.5\%; at 10 nodes under contention, this rose to approximately 38.8\%, consistent with increased collision probability at higher node density and motivating cooperative and scheduling-based mitigation; the two measurements were not collected as a fully controlled scaling experiment, so the entire difference should not be attributed to node count alone.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g13_timeout_rate_scaling.png}
+\caption{Timeout rate at 3 vs.\ 10 nodes; not a controlled scaling experiment, but consistent with increased contention at higher node density.}
+\label{fig:timeout-scaling}
+\end{figure}
+
+\subsection{Policy Comparison Under Symmetric Conditions}
+Table~\ref{tab:policy-clean} reports gateway-share by scheduling policy under symmetric (non-interference) conditions, aggregated over two repeated rounds (the interference-response comparison in Fig.~\ref{fig:interference} labels this same clean baseline as a single aggregated reference point, not as an independently repeated measurement).
+
+\begin{table}[t]
+\caption{Gateway 1 Share by Policy, Clean Baseline}
+\label{tab:policy-clean}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Policy & GW1 share & $n$ (acks) \\
+\midrule
+Broadcast & 52.1\% & 5{,}157 \\
+Round-robin & 50.6\% & 2{,}400 \\
+Random & 56.2\% & 2{,}062 \\
+Belief-only & 61.3\% & 2{,}372 \\
+State-aware & 50.6\% & 6{,}686 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{g02_policy_comparison_clean_baseline.png}
+\caption{Gateway 1 acknowledgment share by scheduling policy under symmetric conditions.}
+\label{fig:policy-comparison}
+\end{figure}
+
+State-aware and round-robin produce the same aggregate observed gateway share in the clean baseline (50.6\% each); this indicates matching aggregate distribution, not necessarily matching per-decision agreement, which was not separately measured. Broadcast's reported 52.1\% (rather than an exact 50/50 split of individual gateway transmissions) reflects that Algorithm~\ref{alg:scheduler} restricts the chosen set $\mathcal{A}$ to gateways whose budget is not exhausted even under the broadcast policy; on the small fraction of acknowledgments where one gateway's rolling airtime budget was momentarily exhausted, broadcast fell back to the single available gateway, producing a mild asymmetry rather than a definitional error. The differing acknowledgment counts across policies in Table~\ref{tab:policy-clean} (2{,}400 for round-robin vs.\ 6{,}686 for state-aware) reflect that policy run durations and offered telegram traffic were not equalized across the campaign; this is a limitation of the current campaign design rather than a property of the policies themselves.
+
+\subsection{Interference Response}
+\label{sec:results-interference}
+Under controlled interference generated by a dedicated ESP32+SX1262 board transmitting a pseudo-random ON/OFF schedule (mean ON duration 17.3~s, mean OFF duration 39.0~s, 30.8\% duty cycle -- a deliberately elevated, laboratory-controlled interference-source setting, not itself a compliant LoRa transmission profile, verified against 137 logged transitions over a 63.8-minute session) positioned near one gateway, comparison of per-gateway HMM belief during the affected runs (mean 0.584 for the degraded link vs.\ 0.676 for the unaffected link) identifies Gateway 2 (GW2) as the interference-affected gateway in this session; an increasing GW1 share therefore represents redirection toward the unaffected Gateway 1. State-aware scheduling redirected acknowledgments toward Gateway 1: 57.2\% $\pm$ 2.1\% (mean $\pm$ SD, $n=3$ independent 20-minute runs) of acknowledgments were sent through the unaffected gateway, compared to 50.6\% under symmetric conditions -- a 6.6 percentage-point shift, consistently observed across all three runs (55.9\%, 59.6\%, 56.2\%). Reconstruction during these runs averaged 69.7\% (range 68.4--71.7\%) (Fig.~\ref{fig:interference}).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g04_interference_individual_runs.png}
+\caption{Per-run breakdown of the interference-response result: all three independent 20-minute runs show a consistent redirection above the 50.6\% clean baseline.}
+\label{fig:interference-runs}
+\end{figure}
+
+This demonstrates a change in gateway-selection \emph{behavior} under interference; it does not, on its own, establish an improvement in reconstruction rate or acknowledgment delivery relative to a non-adaptive policy under the same interference condition, since a matched round-robin-under-interference comparison was not run in this campaign (Section~VI).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{g03_interference_response_hardware.png}
+\caption{State-aware scheduling response: gateway share under symmetric vs.\ interference conditions (real hardware).}
+\label{fig:interference}
+\end{figure}
+
+The interference source's own transition log, while captured, could not be reliably time-aligned to the corresponding hardware run due to a device reset between logging sessions; direct hardware validation of HMM belief against this ground truth is therefore not reported here, and is addressed instead through simulation (Section~\ref{sec:results-sched}).
+
+\subsection{Feedback-Budget Sweep}
+\label{sec:results-budget}
+Table~\ref{tab:budget} reports reconstruction rate as the per-gateway acknowledgment duty-cycle budget is varied across a 50$\times$ range.
+
+\begin{table}[t]
+\caption{Reconstruction Rate vs.\ Feedback Budget}
+\label{tab:budget}
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Duty limit & Reconstructed & Timed out & Rate \\
+\midrule
+0.10 & 220 & 53 & 80.6\% \\
+0.05 & 213 & 59 & 78.3\% \\
+0.02 & 220 & 57 & 79.4\% \\
+0.01 & 218 & 45 & 82.9\% \\
+0.005 & 216 & 57 & 79.1\% \\
+0.002 & 215 & 56 & 79.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+No clear monotonic trend is observed across this 50$\times$ range (78.3--82.9\%, spread 4.6 percentage points); we did not perform a formal statistical test for trend. We report this as an observed null pattern rather than a statistically-established absence of effect: at the deployment scale and telegram rate tested, the acknowledgment budget did not appear to be the binding constraint on reconstruction rate; this does not establish that the budget could never be binding at other scales or rates. This does not contradict the interference-response finding above, which concerns \emph{which} gateway is selected, not \emph{whether} an acknowledgment can be sent at all.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{g05_reconstruction_vs_feedback_budget.png}
+\caption{Reconstruction rate vs.\ per-gateway feedback budget: no clear monotonic trend across a 50$\times$ range.}
+\label{fig:budget-sweep}
+\end{figure}
+
+\subsection{Premise Analysis: Does Uplink State Predict Downlink Success?}
+\label{sec:results-premise}
+Because the scheduler's state-aware policy relies on uplink interference belief as a proxy for downlink acknowledgment delivery probability, we directly tested this premise. Joining uplink observations with acknowledgment outcomes on (node, telegram) across 5{,}372 records, uplink HMM belief predicts downlink success with AUC = 0.619, above the 0.5 chance level -- the highest of five predictors tested, though by a small margin over mean SNR (0.610; minimum SNR: 0.565; mean RSSI: 0.564; gateway count: 0.577). The margin over raw SNR is modest and is consistent with, but does not by itself establish, an additional contribution from the HMM's temporal filtering beyond the instantaneous reading. This dataset pools acknowledgment outcomes across all scheduling policies exercised during the campaign, including policies whose gateway choice itself depends on belief (state-aware, belief-only); we have not verified that the resulting AUC is free of selection bias from policy-dependent gateway assignment, and this should be treated as observational evidence for the premise rather than a fully controlled predictive validation. We likewise have not separated train/evaluation portions of this specific 5{,}372-record join by telegram or node, so the effective number of independent observations underlying the AUC estimate may be smaller than the raw record count suggests.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g06_auc_predictor_comparison.png}
+\caption{AUC of five candidate predictors of downlink acknowledgment success; HMM belief leads but by a modest margin over raw SNR.}
+\label{fig:auc-predictors}
+\end{figure}
+
+\subsection{Gradient Boosting Reliability Estimation}
+The classifier was trained with an 80/20 stratified random split at the observation level (\texttt{GradientBoostingClassifier}, 100 estimators, max depth 3, learning rate 0.1, seed 42) on 27{,}156 observations (5{,}324 positive, 21{,}832 negative), achieving 95.2\% test accuracy against an 80.4\% majority-class baseline -- a 14.8 percentage-point margin. The classifier predicts a binary label indicating whether the reporting gateway independently received all fragments of the telegram (positive) or only a subset (negative). These 27{,}156 observations were collected during an earlier twelve-node hardware deployment predating the ten-node scheduling campaign of Section~V; the two datasets serve different purposes (reliability-model training vs.\ scheduling-mechanism evaluation) and are not merged or directly compared. Because training examples are logged per (telegram, gateway) pair without a retained telegram identifier in the full 27{,}156-example set, standard grouped splitting could not be applied to that set directly. A subset of 17{,}174 examples (63.2\% of the full set) retained telegram and node identifiers via cross-referencing against the graph-observation log; re-evaluating on this subset under grouped splits gave 95.2\% (grouped by telegram), 95.8\% (grouped by node -- holding out entire transmitters), and 99.4\% (chronological split), each clearing its respective majority baseline by 13--18 percentage points; the chronological split's higher accuracy (99.4\%) should not be interpreted as evidence of stronger generalization than the other two splits. For the node-grouped split, the historical-success feature $h_g^n(t)$ for a held-out node $n$ is computed strictly from that node's own prior observations within the evaluation fold, in chronological order, using the same $h_g^n(t)=0.5$ default for a node's earliest observations as in training; no information from the held-out node's future observations, nor from any other node, enters this feature. This preserves the group-holdout property for model training while allowing the feature to accumulate within a held-out node's own timeline, matching how it would be computed operationally for a newly deployed node. We therefore characterize this as a warm-start node-grouped evaluation -- the model was never trained on this node's own data, but its 95.8\% accuracy benefits from that node's within-fold history accumulating as the fold progresses -- rather than a strict cold-start test of generalization to a node with no observed history at all. This accuracy measures prediction of the defined reliability label and does not by itself imply a corresponding improvement in telegram reconstruction rate, per Proposition~1: the classifier demonstrates that link state is predictable, while Proposition~1 establishes that such predictability cannot improve availability when used only to select among already-valid duplicate fragments. We report this grouped-split validation as evidence the original accuracy figure was not substantially inflated by telegram-level leakage, while noting that the leakage audit was only possible on the identifiable subset.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g08_gb_accuracy_across_splits.png}
+\caption{Gradient Boosting accuracy across four evaluation splits, all clearing the majority-class baseline by 13--18 percentage points.}
+\label{fig:gb-splits}
+\end{figure}
+
+Feature importances (Fig.~\ref{fig:feature-importance}) are dominated by historical success rate (0.658), followed by minimum SNR (0.131), mean SNR (0.122), HMM belief (0.084), and mean RSSI (0.005).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{g07_gb_feature_importance.png}
+\caption{Gradient Boosting feature importance, trained on 27{,}156 real observations (95.2\% observation-level test accuracy; 95.2\% telegram-grouped accuracy on the 17{,}174-observation identifiable subset); historical success rate dominates.}
+\label{fig:feature-importance}
+\end{figure}
+
+\subsection{Hard-Decision Combining Verification}
+\label{sec:results-sim}
+The discrete-event simulator of Section~\ref{sec:sim} was swept over 10--60 nodes (10 random seeds each) to test whether hard-decision duplicate-selection strategy affects reconstruction once the CRC gate is enforced. Three strategies representing fundamentally different weighting rules -- blind trust of every CRC-valid observation, HMM-belief-weighted preference among duplicates, and genie access to ground-truth channel state -- were compared telegram-by-telegram. Across all 60 (node-count, seed) combinations, the three strategies produced \emph{zero} outcome mismatches: every telegram was reconstructed, or not, identically regardless of which strategy nominally selected among duplicate valid fragments. Telegram Error Rate was consistent across node counts (0.544--0.565, mean $\pm$ SD given in Table~\ref{tab:hard-decision-sweep}), reflecting channel and deployment variability common to all strategies rather than a combining-strategy effect -- the TER values do not vary monotonically with node count, so this sweep should not be read as demonstrating a density-dependent trend. This provides an implementation-level verification that our simulator correctly follows Proposition~1's mathematical rule, using the same Gilbert-Elliott channel formulation and belief model as the rest of this paper's simulation results; because the three strategies operate on the same underlying fragment-availability set by construction, identical outcomes are the expected consequence of the definition rather than an independent empirical test of the proposition itself. It removes the soft-decision idealization gap present in earlier drafts of this work: the hardware receivers expose only CRC-gated hard decisions, while the discrete-event verification confirms that, under this same reception model, reliability-based selection cannot alter availability.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g09_hard_decision_ter_vs_nodecount.png}
+\caption{Telegram Error Rate across the 10--60 node sweep, showing no density-dependent trend and no combining-strategy effect.}
+\label{fig:ter-sweep}
+\end{figure}
+
+A separate simulation verification run generated 10{,}000 raw (node, fragment, gateway) observations under the same channel model (10 nodes $\times$ 100 telegrams $\times$ 5 fragments $\times$ 2 gateways; 2{,}427 CRC-valid, 7{,}573 corrupted or lost), again comparing the three strategies. Of the 1{,}000 attempted telegrams, 835 had at least one CRC-valid observation and therefore entered the reconstruction computation; the remaining 165 had zero CRC-valid observations across all ten raw attempts and are excluded from both the numerator and denominator below, following the same convention as the availability function used throughout this verification. Of the 835 telegrams with at least one CRC-valid observation, 429 were reconstructed (51.4\%), with identical outcomes across all three strategies for every telegram -- consistent with, and independent confirmation of, the node-count sweep above. Against the full 1{,}000 attempted telegrams including those with no valid data, the reconstruction rate is 42.9\%. This reconstruction rate reflects this specific channel realization and configuration rather than a general system-level figure; the union-invariance finding itself (identical outcomes across strategies) is unaffected by which denominator is used.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g10_independent_10k_verification.png}
+\caption{Independent 10,000-observation verification run: raw CRC outcomes (left) and resulting telegram reconstruction (right), with identical outcomes across all three combining strategies.}
+\label{fig:10k-verification}
+\end{figure}
+
+\begin{table}[t]
+\caption{Hard-Decision Combining Sweep: Telegram Error Rate}
+\label{tab:hard-decision-sweep}
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+Nodes & Mean TER & SD \\
+\midrule
+10 & 0.565 & 0.078 \\
+20 & 0.544 & 0.064 \\
+30 & 0.554 & 0.081 \\
+40 & 0.545 & 0.066 \\
+50 & 0.549 & 0.048 \\
+60 & 0.547 & 0.049 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Discrete-Event Scheduling Simulation}
+\label{sec:results-sched}
+The scheduling mechanism of Section~\ref{sec:scheduling} was additionally evaluated in simulation, using the same Gilbert-Elliott channel formulation and HMM belief model as Section~\ref{sec:results-sim}'s combining verification, over 15 random topology seeds per configuration. Gateway 1 (GW1) is the interference-affected gateway throughout this section; a decreasing GW1 share therefore represents redirection toward Gateway 2, the unaffected gateway. We note that this assignment is specific to the simulation study and is the reverse of Section~\ref{sec:results-interference}'s hardware assignment, in which GW2 was identified as the affected gateway and GW1 as unaffected; ``GW1''/``GW2'' denote arbitrary simulated or logged gateway indices within each study rather than a fixed physical gateway identity carried across sections, and no comparison in this paper relies on GW1 referring to the same physical or simulated gateway in both studies. Unlike the combining verification, this study's belief signal is a continuous link-quality estimate informing acknowledgment routing, not a fragment-validity decision, and is therefore not subject to the CRC gate. A severity sweep (Table~\ref{tab:sim-severity}) shows a monotonic decrease in the mean simulated gateway share as the modeled interference severity (SNR degradation on the interference-affected gateway's arriving packets) increases.
+
+\begin{table}[t]
+\caption{Simulated Scheduling Response to Interference Severity}
+\label{tab:sim-severity}
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+Severity (dB) & GW1 share (mean $\pm$ SD) & Diff.\ from hardware baseline (50.6\%), pp\textsuperscript{*} \\
+\midrule
+0.0 & 49.1\% $\pm$ 9.6 & $-1.5$pp \\
+0.5 & 46.7\% $\pm$ 9.1 & $-3.9$pp \\
+1.0 & 44.1\% $\pm$ 9.3 & $-6.5$pp \\
+2.0 & 32.6\% $\pm$ 8.0 & $-18.0$pp \\
+5.0 & 9.5\% $\pm$ 4.1 & $-41.1$pp \\
+\bottomrule
+\end{tabular}
+
+\noindent\textsuperscript{*}Shift is relative to the hardware campaign's clean-baseline gateway share (50.6\%, Table~\ref{tab:policy-clean}), not to this table's own 0.0~dB row (49.1\%), so that severity levels can be directly compared against the hardware-measured effect the simulation severity was selected to approximate.
+\end{table}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g11_simulated_severity_sweep.png}
+\caption{Simulated GW1 share vs.\ interference severity, with the severity level (1.0~dB) whose displacement from the hardware baseline most closely matches the hardware-measured shift marked.}
+\label{fig:severity-sweep}
+\end{figure}
+
+Within simulation, GW1 share decreases from 49.1\% at 0~dB to 44.1\% at 1.0~dB, a 5.0-percentage-point reduction against the simulation's own baseline. This simulated response is qualitatively consistent with the 6.6-percentage-point hardware redirection observed under controlled interference; the two are not the same measurement, and 1.0~dB was selected as the severity whose displacement relative to the hardware baseline (Table~\ref{tab:sim-severity}, footnote) most closely matches the hardware effect in magnitude, not as an independently derived physical severity estimate. We therefore interpret the simulation as qualitatively corroborating the direction and approximate scale of the hardware response -- a 5.0-percentage-point internal shift yielding a result 6.5 percentage points from the hardware reference, comparable in magnitude to the hardware's own 6.6-point shift -- rather than as a quantitative reproduction of one identical measurement. State-aware and belief-only policies both redirected acknowledgments to this level, while round-robin and broadcast remained exactly at 50.0\% $\pm$ 0.0\%, confirming these non-adaptive policies are correctly insensitive to interference severity. State-aware and belief-only are not distinguishable in this simulation because, absent genuine downlink receipt observations, both converge to ranking gateways by the same underlying belief signal.
+
+Because the simulator exposes its own latent Gilbert-Elliott state -- unlike the hardware campaign, whose interference log could not be time-aligned -- the HMM's state estimate could be directly checked against it, though this remains an in-simulation consistency check rather than an independent validation, since the simulator generates observations from the same two-state Gilbert-Elliott structure the HMM assumes. Classifying an observation as GOOD when $\hat{p}(t) \geq 0.5$ and BAD otherwise, and comparing against the simulator's latent state across all simulated observations, state-classification accuracy was 87.3\%. This should not be compared against a naive 50\% baseline: the stationary GOOD-state probability implied by Table~\ref{tab:hmm-params}'s own transition parameters is $\pi_{\text{GOOD}} = (1-P(\text{BAD}\to\text{BAD}))/[(1-P(\text{BAD}\to\text{BAD}))+(1-P(\text{GOOD}\to\text{GOOD}))] = 0.40/0.55 \approx 72.7\%$, so a trivial classifier that always predicts GOOD would already be expected to score close to this figure under the assumed model; 87.3\% should be read against this theoretical majority-class baseline, not against 50\% chance.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{g12_hmm_ground_truth_validation.png}
+\caption{HMM state-classification accuracy against the simulator's latent Gilbert-Elliott ground truth, compared to the theoretical majority-class baseline ($\approx$72.7\%) implied by Table~\ref{tab:hmm-params}'s own transition parameters, not to 50\% chance.}
+\label{fig:hmm-validation}
+\end{figure}
+
+\section{Limitations}
+
+\textit{Commodity-hardware receiver limitation.} Because the gateways are built from commodity SX1262/SX1276 transceivers rather than software-defined radios, only hard-decision (CRC pass/fail) observations are available at the receiver. The discrete-event combining simulation (Section~\ref{sec:results-sim}) now enforces the same CRC gate, so this is not a simulation-vs-hardware discrepancy; it is a stated design constraint of the receiver itself, and Proposition~1 establishes that no combining strategy -- on hardware or in this simulation -- can escape it. Although the seven SX1262 and three SX1276 transmitter nodes were configured identically at the application and nominal PHY levels, no controlled comparison was performed to quantify any device-family-specific reception differences between them.
+
+\textit{Single-session statistical repetition.} Campaign results are drawn from a single deployment session with two or three repeated runs per condition (8--20 minutes each); further independent sessions, ideally on different days and physical layouts, would strengthen the reported confidence intervals.
+
+\textit{Downlink belief is uplink-primed, not outcome-learned.} The downlink belief driving state-aware and belief-only scheduling is seeded from uplink interference state and does not update from confirmed acknowledgment delivery, since nodes do not currently report acknowledgment receipt upstream. Adding this would require a new uplink message type and is left to future work.
+
+\textit{No matched-baseline reconstruction comparison under interference.} We show that state-aware scheduling changes gateway-selection behavior under controlled interference (Section~\ref{sec:results-interference}), but we did not run round-robin or belief-only under the identical interference condition to test whether this behavioral change also improves telegram reconstruction rate or acknowledgment delivery. The reconstruction and gateway-selection results reported here should therefore be read as establishing a behavioral mechanism, not a demonstrated reliability improvement.
+
+\textit{D-FRAG baselines not run under matched load, and its timing budget is independently parameterized.} Comparison against non-learning timing policies (fixed, random, round-robin) under matched conditions was not performed in this campaign. In addition, D-FRAG's 4--7~s timing configurations (Table~\ref{tab:dfrag-actions}) were parameterized against the testbed's bench airtime budget rather than the illustrative $\mathcal{D}_{\text{node}}=2.5\%$ figure used in Proposition~2's capacity calculation (Section~\ref{sec:dfrag}); we report D-FRAG as implemented and exercised using reconstruction-outcome feedback delivered through the acknowledgment path, not as demonstrated to out-perform non-learning alternatives, and not as validated against the illustrative duty-cycle parameters used elsewhere in this paper.
+
+\textit{Motivation--result gap for the acknowledgment budget.} The architecture is motivated by scenarios in which acknowledgments must be rationed under a binding gateway duty-cycle budget (Section~\ref{prop:capacity}); however, the feedback-budget sweep (Section~\ref{sec:results-budget}) found no such binding constraint at the deployment scale and telegram rate tested. The interference-response result (Section~\ref{sec:results-interference}) therefore demonstrates that state information can influence \emph{which} gateway receives an acknowledgment, not that this redirection resolves an observed binding-budget problem in the reported campaign; whether the mechanism provides benefit under an actually-binding budget remains to be shown.
+
+\textit{Hardware HMM validation incomplete.} The controlled interference source's transition log could not be reliably time-aligned with the corresponding hardware run; HMM state-classification verification against ground truth is reported only in simulation (Section~\ref{sec:results-sched}), where it constitutes an in-simulation consistency check rather than an independent hardware validation.
+
+\textit{Gradient Boosting calibration.} The classifier's raw scores are not post-hoc calibrated and should not be interpreted as well-calibrated absolute probabilities (see Section~IV).
+
+\textit{AUC premise analysis is observational.} The AUC~=~0.619 premise-analysis result (Section~\ref{sec:results-premise}) pools outcomes across policies whose gateway assignment itself depends on belief, and was not evaluated under a held-out train/test or grouped split; it should be read as observational support for the premise, not a fully controlled predictive benchmark.
+
+\textit{No security mechanism.} The architecture does not address confidentiality, authentication, or integrity of the LoRa payload or the downlink acknowledgment channel.
+
+\section{Future Work}
+
+\textit{Matched-baseline interference comparison.} Running round-robin and belief-only alongside state-aware under the identical controlled-interference condition would establish whether the observed gateway-selection shift (Section~\ref{sec:results-interference}) translates into improved reconstruction rate or acknowledgment delivery, closing the gap noted in Section~VI.
+
+\textit{Downlink receipt reporting.} Extending node firmware to report acknowledgment receipt upstream would allow the downlink belief to learn from genuine outcomes rather than relying solely on the uplink prior, and would enable state-aware and belief-only policies to diverge meaningfully.
+
+\textit{D-FRAG baseline comparison.} Running fixed, random, and round-robin timing policies under matched load, using the same hardware and node count, would establish whether D-FRAG's EXP3 learning provides a measurable advantage over non-adaptive timing.
+
+\textit{Repeated independent hardware sessions.} Additional sessions across different days and physical deployments would tighten the confidence intervals reported here and test generalization beyond a single physical layout.
+
+\textit{Direct hardware HMM validation.} A repeated interference-response session with reliable time synchronization between the interference source and the network server would allow direct hardware validation of HMM belief against logged ground truth, complementing the simulation-based state-classification verification reported here.
+
+\section{Conclusion}
+
+This paper presented SAF-LoRa, a state-aware feedback-scheduling architecture for split-telegram LoRa networks on commodity hardware. We established analytically and verified computationally through discrete-event simulation that reliability weighting among CRC-valid duplicate fragments cannot improve telegram availability under hard-decision reception, and relocated state awareness to downlink acknowledgment scheduling, where it demonstrably changes gateway-selection behavior: on a ten-node hardware testbed, state-aware scheduling redirected 57.2\% $\pm$ 2.1\% of acknowledgments toward an unaffected gateway under controlled interference, versus 50.6\% under symmetric conditions. A discrete-event simulation using the same Gilbert-Elliott channel formulation and HMM belief model produced a comparable-magnitude response at a severity level selected to produce a comparable gateway-share displacement -- a 5.0-percentage-point change in simulated gateway share between its own 0~dB and 1.0~dB conditions, whose 1.0~dB result (44.1\%) falls 6.5 percentage points below the hardware clean-baseline reference (50.6\%), close in magnitude to the hardware's 6.6-point shift though not the same measurement -- and verified the HMM's state classification against ground truth in simulation (87.3\% accuracy) where the hardware campaign's own interference log could not be time-aligned. An HMM--Gradient Boosting reliability estimator, used as auxiliary support for the scheduler's belief premise rather than as an input to the scheduler itself, achieved 95.2\% telegram-grouped accuracy on the 17{,}174-observation identifiable subset (95.2\% at the observation level on the full 27{,}156-observation dataset), and a decentralized EXP3 timing policy (D-FRAG) was exercised using reconstruction-outcome feedback delivered through the acknowledgment path. A Temporal Graph Attention Network evaluated as an alternative gateway-selection mechanism did not clear a majority-class baseline under leakage-free grouped evaluation and is reported in Appendix~\ref{app:tgat} as a negative result, and a feedback-budget sweep found no clear monotonic effect across a 50$\times$ range of duty-cycle limits, reported here as a null result rather than omitted. We emphasize that the hardware and simulation results demonstrate a change in gateway-selection behavior in response to interference, not yet an established improvement in end-to-end reconstruction rate under a matched non-adaptive baseline, which we identify as the most important direction for future work (Section~VII). This combination of a hardware-demonstrated scheduling-redirection mechanism, a formally established hard-decision limitation, and a null feedback-budget result together delineates where state information can influence a commodity LoRa system and where it cannot.
+
+\appendices
+\section{Evaluation of TGAT-Based Gateway Selection}
+\label{app:tgat}
+
+We evaluated a Temporal Graph Attention Network (TGAT) encoder, pretrained on logged telegram reception graphs and intended as a state representation for a Proximal Policy Optimization gateway-selection policy. An initial formulation predicting telegram-level reconstruction success was discarded after we found that a trivial fragment-counting rule matched the trained model's accuracy almost exactly, indicating the label was recoverable from the input features rather than learned. We reformulated the task to predict whether the next observation in a telegram's reception sequence introduces a previously-unseen fragment, and evaluated it using grouped train/validation splits that hold out whole telegrams, so that near-duplicate prefixes of the same telegram cannot straddle the split.
+
+On 47{,}742 prefix examples drawn from 5{,}675 telegrams (11{,}671 positive, 36{,}071 negative), the trained encoder achieved 75.8\% validation accuracy against a 75.6\% majority-class baseline (36{,}071/47{,}742) -- a margin of approximately 0.2 percentage points, effectively no improvement. The model converged to predicting the majority class in every training epoch under the leakage-free grouped evaluation. A fragment-count heuristic achieved the same 75.6--75.8\% range, confirming that the reformulated task did not provide predictive value beyond the fragment-count heuristic under the evaluated grouped split.
+
+The TGAT-PPO formulation was not retained in the proposed architecture, as it did not demonstrate learning beyond the majority-class baseline under leakage-free evaluation; we report this negative result in place of the earlier figures, which were affected by the label leakage described above.
+
+\begin{thebibliography}{99}
+
+\bibitem{mioty2018}
+ETSI, ``Short Range Devices; Low Throughput Networks (LTN); Protocols for radio interface A,'' \emph{ETSI TS 103 357 V1.1.1}, 2018.
+
+\bibitem{etsi_en300220_2}
+ETSI, ``Short Range Devices (SRD) operating in the frequency range 25~MHz to 1~000~MHz; Part 2: Harmonised Standard for access to radio spectrum for non-specific radio equipment,'' \emph{ETSI EN 300 220-2 V3.2.1}, 2018.
+
+\bibitem{semtech_an1200_13}
+Semtech Corporation, ``LoRa Modem Designer's Guide, AN1200.13,'' 2013.
+
+\bibitem{ts2014}
+G. Kilian, M. Breiling, H. H. Petkov, H. Lieske, F. Beer, J. Robert, and A. Heuberger, ``Increasing transmission reliability for telemetry systems using telegram splitting,'' \emph{IEEE Trans. Commun.}, vol.\ 63, no.\ 3, pp.\ 949--961, 2015.
+
+\bibitem{ts2015}
+G. Kilian, H. Petkov, R. Psiuk, H. Lieske, F. Beer, J. Robert, and A. Heuberger, ``Improved coverage for low-power telemetry systems using telegram splitting,'' in \emph{Proc. SmartSysTech}, 2013.
+
+\bibitem{ts2016}
+T. Elshabrawy, S. Nafie, and J. Robert, ``Performance analysis of convolutionally-coded telegram splitting telemetry systems under different ISM/SRD collision behaviors,'' in \emph{Proc. IEEE WCNC}, 2016.
+
+\bibitem{ts2020}
+S. Kisseleff, J. Kneissl, G. Kilian, and W. H. Gerstacker, ``Efficient detectors for telegram splitting based transmission in low power wide area networks with bursty interference,'' \emph{IEEE Trans. Commun.}, vol.\ 68, no.\ 12, pp.\ 7687--7701, 2020.
+
+\bibitem{ts2025}
+S. Lahoud and K. Khawam, ``Fragment-Level Macro-Diversity Reception in LoRaWAN Networks with LR-FHSS,'' in \emph{2025 IEEE Global Communications Conference (GLOBECOM)}, 2025, doi: 10.1109/GLOBECOM59602.2025.11432594.
+
+\bibitem{gw2022}
+A. Petroni and M. Biagi, ``Interference mitigation and decoding through gateway diversity in LoRaWAN,'' \emph{IEEE Trans. Wireless Commun.}, vol.\ 21, no.\ 11, pp.\ 9068--9081, 2022.
+
+\bibitem{gw2020exp}
+K. Mikhaylov, M. Stusek, P. Masek, R. Fujdiak, R. Mozny, S. Andreev, and J. Hosek, ``On the performance of multi-gateway LoRaWAN deployments: An experimental study,'' in \emph{Proc. IEEE WCNC}, 2020, pp.\ 1--6.
+
+\bibitem{gw2021dist}
+B. Citoni, S. Ansari, Q. H. Abbasi, M. A. Imran, and S. Hussain, ``Impact of inter-gateway distance on LoRaWAN performance,'' \emph{Electronics}, vol.\ 10, no.\ 18, p.\ 2197, 2021.
+
+\bibitem{gw2020sf}
+A. Loubany, S. Lahoud, and R. El Chall, ``Adaptive algorithm for spreading factor selection in LoRaWAN networks with multiple gateways,'' \emph{Computer Networks}, vol.\ 182, p.\ 107491, 2020.
+
+\bibitem{gw2023energy}
+A. Loubany, S. Lahoud, A. E. Samhat, and M. El Helou, ``Improving energy efficiency in LoRaWAN networks with multiple gateways,'' \emph{Sensors}, vol.\ 23, no.\ 11, p.\ 5315, 2023.
+
+\bibitem{gw2023throughput}
+A. Loubany, S. Lahoud, A. E. Samhat, and M. El Helou, ``Joint throughput-energy optimization in multi-gateway LoRaWAN networks,'' \emph{Telecommunication Systems}, vol.\ 84, pp.\ 271--283, 2023.
+
+\bibitem{pcube2021}
+X. Xia, N. Hou, and Y. Zheng, ``PCube: Scaling LoRa concurrent transmissions with reception diversities,'' in \emph{Proc. ACM MobiCom}, 2021.
+
+\bibitem{sic2021sigcomm}
+M. O. Shahid, M. Philipose, K. Chintalapudi, S. Banerjee, and B. Krishnaswamy, ``Concurrent interference cancellation: Decoding multi-packet collisions in LoRa,'' in \emph{Proc. ACM SIGCOMM}, 2021, pp.\ 503--515.
+
+\bibitem{sic2021iotj}
+D. Garlisi, S. Mangione, F. Giuliano, D. Croce, G. Garbo, and I. Tinnirello, ``Interference cancellation for LoRa gateways and impact on network capacity,'' \emph{IEEE Access}, vol.\ 9, pp.\ 128133--128146, 2021.
+
+\bibitem{sic2021letters}
+M. Xhonneux, J. Tapparel, P. Scheepers, O. Afisiadis, A. Balatsoukas-Stimming, D. Bol, J. Louveaux, and A. Burg, ``A two-user successive interference cancellation LoRa receiver with soft-decoding,'' in \emph{Proc. IEEE Asilomar}, 2021, pp.\ 948--953.
+
+\bibitem{mclora2023}
+F. Yu, X. Zheng, L. Liu, and H. Ma, ``Enabling concurrency for non-orthogonal LoRa channels,'' in \emph{Proc. ACM MobiCom}, 2023, pp.\ 1--15.
+
+\bibitem{pyramid2024}
+J. Wang, S. Tong, Z. Xu, and P. Xie, ``Real-time concurrent LoRa transmissions based on peak tracking,'' \emph{IEEE Trans. Mobile Comput.}, vol.\ 23, no.\ 10, pp.\ 9582--9594, 2024.
+
+\bibitem{canas2026}
+S. Yu, Z. Zhang, X. Xia, Y. Zheng, and J. Wang, ``Resolving inter-logical channel interference for large-scale LoRa deployments,'' \emph{IEEE Trans. Mobile Comput.}, vol.\ 25, no.\ 2, pp.\ 2759--2773, 2026.
+
+\bibitem{nelora2021}
+C. Li, H. Guo, S. Tong, X. Zeng, Z. Cao, M. Zhang, Q. Yan, L. Xiao, J. Wang, and Y. Liu, ``NELoRa: Towards ultra-low SNR LoRa communication with neural-enhanced demodulation,'' in \emph{Proc. ACM SenSys}, 2021.
+
+\bibitem{srlora2023}
+J. Du, Y. Ren, Z. Zhu, C. Li, Z. Cao, Q. Ma, and Y. Liu, ``SRLoRa: Neural-enhanced LoRa weak signal decoding with multi-gateway super resolution,'' in \emph{Proc. ACM MobiHoc}, 2023, pp.\ 270--279.
+
+\bibitem{takyu2022}
+O. Takyu, G. Kobayashi, K. Adachi, M. Ohta, and T. Fujii, ``Estimation based on chirp modulation for desired and interference power and channel occupancy ratio in LoRa,'' \emph{Sensors}, vol.\ 22, no.\ 11, p.\ 4140, 2022.
+
+\bibitem{loraloc2020}
+M. Anjum, M. A. Khan, S. A. Hassan, A. Mahmood, H. K. Qureshi, and M. Gidlund, ``RSSI fingerprinting-based localization using machine learning in LoRa networks,'' \emph{IEEE Internet of Things Mag.}, vol.\ 3, no.\ 2, pp.\ 53--59, 2020.
+
+\bibitem{lldpc2022}
+K. Yang and W. Du, ``LLDPC: A low-density parity-check coding scheme for LoRa networks,'' in \emph{Proc. ACM SenSys}, 2022.
+
+\end{thebibliography}
+
+\end{document}
