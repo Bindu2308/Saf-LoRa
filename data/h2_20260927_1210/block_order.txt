@@ -1,0 +1,8 @@
+block=1 seed=1009 order=round-robin random state-aware ewma
+block=2 seed=2018 order=round-robin random state-aware ewma
+block=3 seed=3027 order=state-aware random round-robin ewma
+block=4 seed=4036 order=ewma random round-robin state-aware
+block=5 seed=5045 order=random round-robin state-aware ewma
+block=6 seed=6054 order=ewma random state-aware round-robin
+block=7 seed=7063 order=ewma random round-robin state-aware
+block=8 seed=8072 order=round-robin state-aware random ewma

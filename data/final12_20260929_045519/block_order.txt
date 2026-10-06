@@ -1,0 +1,12 @@
+block=1 seed=1009 order=round-robin snr-greedy state-aware ewma
+block=2 seed=2018 order=round-robin snr-greedy state-aware ewma
+block=3 seed=3027 order=state-aware snr-greedy round-robin ewma
+block=4 seed=4036 order=ewma snr-greedy round-robin state-aware
+block=5 seed=5045 order=snr-greedy round-robin state-aware ewma
+block=6 seed=6054 order=ewma snr-greedy state-aware round-robin
+block=7 seed=7063 order=ewma snr-greedy round-robin state-aware
+block=8 seed=8072 order=round-robin state-aware snr-greedy ewma
+block=9 seed=9081 order=state-aware ewma round-robin snr-greedy
+block=10 seed=10090 order=ewma snr-greedy round-robin state-aware
+block=11 seed=11099 order=state-aware round-robin ewma snr-greedy
+block=12 seed=12108 order=state-aware snr-greedy ewma round-robin

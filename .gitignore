@@ -1,0 +1,39 @@
+# logs (regenerable, bulky)
+*.log
+logs/
+
+# editor/backup copies
+*.bak
+*.bak[0-9]
+*.bak_*
+*.backup
+*.backup_*
+*.before_*
+*.orig
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# archives
+*.tar.gz
+*.zip
+wheels/
+
+# trained models (regenerable from training scripts)
+*.pkl
+*.pt
+*.pth
+
+# build
+build/
+*.o
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.synctex.gz

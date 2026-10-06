@@ -1,0 +1,2 @@
+RUN=final12_20260929_045519 DUR=240 GAP=30 BLOCKS=12
+POLICIES=state-aware ewma round-robin snr-greedy

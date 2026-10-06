@@ -1,0 +1,13 @@
+date: 2026-09-29T04:49:04+05:30
+campaign: final12 - 12 paired blocks, 5 policies, randomized order per block
+policies: state-aware ewma round-robin snr-greedy (belief-only dropped: already covered by session B ablation)
+DUR=240s  GAP=30s  ack-quota=0  scheduler-seed=block*100
+blend weight w = n/(n+5)  -- FROZEN, not to be changed
+HMM params: unchanged from sessions A-C
+geometry: 2 gateways, interferer near GW1 (GW2 is the healthy gateway)
+pre-run asymmetry check: q_GW1=0.489 q_GW2=0.751 ceiling=13.1pp (asym_check, 600s)
+primary endpoint: mean paired-block difference in confirmed delivery, all pairs
+statistical unit: BLOCK (n=12), not individual ACK
+analysis: paired t, 95% CI, two-sided, no exclusions except logged invalid runs
+power: 12 blocks, DUR=240s -> ~0.82 power for an 8.2 pp effect
+       (SD 9.8pp from sessions B/C: 6.9pp block variation + 6.9pp measurement)

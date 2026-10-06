@@ -1,0 +1,736 @@
+\documentclass[journal]{IEEEtran}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage[boxed,linesnumbered,ruled]{algorithm2e}
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{etoolbox}
+
+\usepackage{comment}
+\newcommand{\authorfill}[1]{\textbf{\textcolor{red}{[#1]}}}
+% One font size for every table in the paper
+\AtBeginEnvironment{table}{\footnotesize}
+\AtBeginEnvironment{table*}{\footnotesize}
+\setlength{\dbltextfloatsep}{6pt plus 2pt minus 2pt}
+\begin{document}
+
+\title{SAF-LoRa: State-Aware ACK Gateway Scheduling With Feedback for Multi-Gateway LoRa Under Interference}
+
+\author{
+\IEEEauthorblockN{\authorfill{Author name(s)}}
+\IEEEauthorblockA{\authorfill{Department / Institute}}
+}
+
+\maketitle
+
+\begin{abstract}
+Multi-gateway LoRa improves uplink reliability by allowing a network server to exploit reception diversity across gateways, but each downlink acknowledgment (ACK) must still be transmitted through a specific gateway and consumes scarce airtime. This paper asks where channel-state information is most useful in such a split-telegram system. We first show that, with CRC-gated hard-decision reception, selecting among duplicate valid fragments cannot change Reed--Solomon reconstruction availability; state awareness is therefore more useful in the subsequent ACK-gateway decision. We develop SAF-LoRa, a state-aware feedback architecture that reconstructs RS$(5,3)$ telegrams from the union of gateway receptions, tracks gateway conditions using a two-state hidden Markov model, and piggybacks sequence-bound ACK-receipt reports on later uplinks without requiring an additional feedback packet. We formulate ACK allocation as a maximum-weight node--gateway assignment and derive the attainable gain as a function of gateway asymmetry. On a ten-node, two-gateway ESP32+SX1262 testbed, gateway diversity improves reconstruction by $0$--$6.1$ percentage points (mean $2.9$ points). Under controlled interference, SAF-LoRa consistently redirects ACKs toward the healthier gateway. In a pre-specified twelve-block campaign with confirmed ACK outcomes, channel-aware policies shift $6.6$--$13.1$ percentage points more ACKs toward the healthier gateway than round-robin, while the resulting delivery changes agree with the analytical gain model within $1.3$ percentage points. Paired simulations further show that SAF-LoRa recovers $82$--$99.5\%$ of the round-robin-to-oracle gap and follows the predicted gateway-asymmetry slope within $5\%$. These results show that, for commodity hard-decision LoRa, channel-state information is most effective after fragment reconstruction, where it can guide feedback through heterogeneous gateway paths.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LoRa, LPWAN, multi-gateway communication, acknowledgment scheduling, gateway diversity, interference awareness, hidden Markov model, Reed--Solomon coding, feedback scheduling.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+LoRa networks increasingly rely on multiple gateways to improve coverage, reliability, and scalability. A packet lost or corrupted at one gateway frequently reaches another, enabling the network server to exploit spatial diversity. Recent studies address several complementary issues: FDLoRa improves downlink throughput using full-duplex gateways~\cite{yu2025fdlora}, Canas suppresses interference across large deployments~\cite{yu2026canas}, and EdgeSense provides channel-aware parameter adaptation~\cite{lodhi2026edgesense}. These contributions emphasize that downlink capacity and interference mitigation are now vital design considerations in dense networks.
+
+This paper tackles a related problem: \emph{which gateway should transmit the acknowledgment (ACK) after multi-gateway uplink reconstruction?} We explore this in a split-telegram network where Reed--Solomon coded fragments are aggregated across gateways. While localized interference makes multi-gateway diversity essential on the uplink, it creates disparate downlink paths for the return ACK. Although link-state information might intuitively seem helpful during fragment aggregation, commodity LoRa hardware yields binary outcomes—fragments strictly pass or fail CRC. Once duplicate valid fragments arrive, favoring the copy from a higher-quality link provides no additional erasure-decoding gain. We show that state-aware filtering of duplicate valid fragments cannot improve telegram recovery. This observation repurposes channel-state information: rather than evaluating already-accepted fragments, it should govern gateway selection for the subsequent ACK.
+
+\textbf{Example scenario.} Consider the industrial sensing scenario in Fig.~\ref{fig:scenario}, where battery-powered nodes report through two LoRa gateways. Local interference near one gateway causes asymmetric packet loss, so the two gateways may receive different subsets of the same split telegram. For telegram $T_2$, suppose Gateway~1 receives $\{F_3,F_4\}$ while Gateway~2 receives only $\{F_1\}$. Neither gateway can reconstruct the telegram independently, but the server can decode it from the union $\{F_1,F_3,F_4\}$. If both gateways receive the same fragment, retaining either CRC-valid copy leaves reconstruction unchanged. The remaining actionable decision is therefore the ACK path: if one gateway is currently degraded, the ACK should preferably be transmitted through the healthier gateway. This simple case captures the separation between multi-gateway reception and ACK-gateway scheduling that motivates our design.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{Architecture (1).png}
+\caption{Illustrative SAF-LoRa scenario. Interference affects the gateways
+differently, the network server reconstructs a split telegram from the union of
+CRC-valid fragments, and the ACK is transmitted through the healthier gateway.
+The example illustrates the mechanism; measured gateway overlap is reported in Section~\ref{sec:results-diversity}.}
+\label{fig:scenario}
+\end{figure*}
+
+
+We develop \textbf{SAF-LoRa}, a state-aware ACK-gateway scheduling architecture for multi-gateway LoRa. SAF-LoRa separates the system into a data plane and a feedback plane. The data plane reconstructs RS$(5,3)$ telegrams from the union of CRC-valid gateway receptions. The feedback plane maintains a two-state hidden Markov model (HMM) from uplink SNR observations and uses the resulting gateway-state estimates to select an ACK gateway subject to an airtime budget. To obtain direct evidence of downlink delivery, nodes piggyback a sequence-bound ACK-receipt status on the next uplink without transmitting an additional feedback packet. This enables a confirmed-outcome variant, SAF-LoRa-F, that combines the uplink state estimate with recent ACK outcomes.
+
+We analyze when such state-aware gateway selection can provide a useful gain. ACK allocation is formulated as a maximum-weight node--gateway assignment. For two gateways with ACK-delivery probabilities $q_1$ and $q_2$, ideal state-aware selection gains $|q_1-q_2|/2$ over blind uniform selection. Consequently, the benefit is fundamentally limited by the asymmetry between the available gateway paths: when the gateways experience similar delivery conditions, little gain is possible regardless of the scheduler.
+
+We evaluate SAF-LoRa on a ten-node ESP32+SX1262 testbed with two gateways and a Raspberry Pi server. Measurements across 17 hardware runs show that the gateway union improves reconstruction by up to $6.1$ percentage points over the better individual gateway. Controlled-interference experiments show that SAF-LoRa consistently redirects ACKs toward the healthier gateway. A pre-specified twelve-block campaign with confirmed ACK outcomes further shows that state-aware policies shift $6.6$--$13.1$ percentage points more ACKs toward the healthier gateway than round-robin, and the resulting delivery changes agree with the analytical gain model within $1.3$ percentage points. Paired simulations complement the hardware study by exploring interference, gateway asymmetry, ACK scarcity, and gateway scaling; the uplink-primed SAF-LoRa recovers $82$--$99.5\%$ of the round-robin-to-oracle gap over the tested interference range.
+
+The main contributions are:
+
+\begin{itemize}
+    \item \textbf{Hard-decision analysis:} We prove that selecting among duplicate CRC-valid fragments cannot improve reconstruction availability and identify ACK-gateway selection as the actionable state-aware decision.
+
+    \item \textbf{SAF-LoRa design:} We develop an airtime-aware ACK scheduler combining gateway-state estimation, multi-gateway reconstruction, and sequence-bound ACK-receipt feedback on commodity LoRa hardware.
+
+    \item \textbf{Scheduling model:} We formulate ACK allocation as a maximum-weight node--gateway assignment and derive the two-gateway gain as a function of gateway-delivery asymmetry.
+
+    \item \textbf{Hardware and simulation evaluation:} We validate gateway diversity, interference-driven ACK redirection, confirmed ACK delivery, quota-constrained operation, and the predicted asymmetry dependence using randomized hardware campaigns and paired simulations.
+\end{itemize}
+
+The remainder of the paper is organized as follows. Section~II reviews related work. Section~III presents the system model and analysis. Section~IV describes the SAF-LoRa design and implementation. Sections~V and~VI present the hardware and simulation evaluations, respectively. Section~VII discusses limitations, and Section~VIII concludes the paper.
+
+\begin{comment}
+In multi-gateway LoRa networks, several gateways can receive fragments of the same split telegram, and local interference usually affects them differently. The network server reconstructs from the union of CRC-valid fragments, so gateway diversity preserves a telegram when one gateway is degraded and the other is not. With commodity hard-decision receivers, a fragment either passes CRC or is discarded. Once two gateways deliver the same CRC-valid fragment, choosing between those duplicate copies cannot improve reconstruction availability.
+
+Link-state information can, however, improve a different decision: which gateway should send the downlink acknowledgment. Each ACK costs gateway airtime, and a node may be reachable through gateways with very different delivery conditions. If gateway~1 is currently interfered, an ACK routed through gateway~2 is more likely to arrive. SAF-LoRa therefore moves interference-state awareness from duplicate-fragment selection, where it provably cannot help, to the gateway-selection decision, where it can. The data plane (multi-gateway reception and Reed--Solomon reconstruction) and the feedback plane (state estimation and ACK gateway selection) are designed and evaluated separately, because Proposition~1 shows that the second cannot change the first.
+
+\textit{Example scenario.} Consider a factory floor where battery-powered sensors report to two gateways (Fig.~\ref{fig:industrial_example}). Interference near one gateway corrupts some of its fragments while the other still receives them; the server rebuilds each telegram from the union, and SAF-LoRa sends each ACK through the gateway that interference is not currently degrading. For $T_2$, Gateway~1 receives $\{F_3,F_4\}$ and Gateway~2 only $\{F_1\}$, so neither alone can decode it, but the union $\{F_1,F_3,F_4\}$ can. Where both gateways hold the same fragment, keeping either copy changes nothing. The decision that matters is the ACK: Gateway~2's poor reception from node~2 indicates a weaker link, so SAF-LoRa acknowledges node~2 through Gateway~1.
+
+
+
+\subsection{Contributions}
+\begin{itemize}
+\item \textbf{Availability theory.} We prove that selecting among CRC-valid duplicate fragments cannot change reconstruction availability and that the full gateway union is never worse than any subset. We formulate budgeted ACK allocation as a maximum-weight node--gateway matching and derive the two-gateway gain of state-aware selection, $|q_1-q_2|/2$, and its belief form.
+\item \textbf{A closed interference--ACK--feedback architecture.} SAF-LoRa combines RS(5,3) telegram splitting and multi-gateway reception (data plane) with an HMM that updates from physical-layer observations, including the SNR of CRC-failed receptions, airtime-budgeted ACK gateway selection, and a piggybacked, sequence-bound ACK-receipt mechanism that requires no additional uplink packet (feedback plane). The primary scheduler is driven by uplink state; the confirmed-outcome extension (SAF-LoRa-F) closes the feedback loop by using the receipt reports.
+\item \textbf{Hardware demonstration.} On a ten-node ESP32+SX1262 testbed we characterize gateway diversity from the receiver logs of 17 hardware runs spanning the node-sweep, interference and policy experiments, show consistent redirection of ACKs away from an interfered gateway, and measure HMM response time, feedback latency and availability, and ACK airtime, and we compare multiple baseline and state-aware policies in randomized hardware blocks.
+\item \textbf{Paired simulation study.} The uplink-primed SAF-LoRa recovers 82--99.5\% of the oracle gap, has higher mean delivery than SNR-greedy through 2~dB and at every multi-gateway count tested, and follows Proposition~4 in slope; adaptive fusion with confirmed outcomes remains robust when uplink and downlink disagree, when the uplink is stale, and when receipt reports are lost.
+\end{itemize}
+\end{comment}
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=2\columnwidth]{FLOWCHART1.png}
+    \caption{Overview of the SAF-LoRa system architecture. Ten LoRa nodes transmit split telegrams that are received by multiple gateways. Reception observations are used by the HMM to estimate the interference state, and the resulting state belief is provided to the gateway-selection scheduler. The selected gateway supports the ACK/downlink path, while the network server performs telegram reconstruction and maintains the ACK ledger.}
+    \label{fig:saf_lora_architecture}
+\end{figure*}
+
+
+\section{Related Work}
+
+\textbf{Downlink and ACK gateway scheduling.}
+LoRa research has increasingly recognized the downlink as a system bottleneck. Caillouet \emph{et al.}~\cite{caillouet2024} show that downlink traffic can consume a substantial fraction of LoRaWAN capacity and study gateway selection as one mechanism for relieving duty-cycle pressure. Yang~\cite{yang2025} addresses multi-gateway downlink allocation using Lyapunov optimization and learned policies, while Al Mojamed~\cite{mojamed2023} selects the ACK gateway according to remaining duty-cycle capacity and reports improvements over SNR-based selection. Aissaoui Ferhi~\cite{ferhi2025} instead learns whether an ACK should be transmitted at all. More recently, FDLoRa~\cite{fdlora2025} increases downlink concurrency through full-duplex gateway hardware. These approaches primarily optimize gateway occupancy, ACK suppression, or available downlink capacity. SAF-LoRa addresses a complementary question: given that one ACK is to be sent, which gateway offers the better delivery path under time-varying interference, and how can that decision be refined using confirmed ACK outcomes?
+
+\textbf{Multi-gateway reception and interference-aware LoRa.}
+Multi-gateway diversity has been widely exploited on the uplink. Petroni and Biagi~\cite{gw2022} use gateway diversity for interference mitigation and decoding, Citoni \emph{et al.}~\cite{gw2021dist} study the effect of inter-gateway distance, and Loubany \emph{et al.}~\cite{gw2023energy, gw2023throughput} optimize throughput and energy efficiency in multi-gateway LoRaWAN. PCube~\cite{pcube2021} exploits reception diversity to scale concurrent transmissions, while SRLoRa~\cite{srlora2023} combines observations from several gateways for neural weak-signal decoding. Recent TMC work further emphasizes interference-aware LoRa design: Canas~\cite{canas2026} resolves inter-logical-channel interference through enhanced gateway processing, while FDLoRa~\cite{fdlora2025} improves downlink concurrency using full-duplex gateways. EdgeSense~\cite{edgesense2026} represents another recent direction, using SNR-aware learning to adapt LoRa spreading factor and transmit power under changing channel conditions. These systems adapt reception, PHY parameters, or gateway hardware; SAF-LoRa instead uses temporal link-state information to control the gateway carrying a post-reconstruction ACK. Recent EdgeSense work appeared in \emph{IEEE Transactions on Mobile Computing} in 2026 and explicitly targets real-time adaptation to changing LoRa channel conditions.
+
+\textbf{Fragment diversity, enhanced decoding, and feedback.}
+Telegram splitting distributes a message across several fragments so that bursty interference need not destroy the complete message. Lahoud and Khawam~\cite{ts2025} analyze fragment-level macro-diversity for LR-FHSS, where several gateways jointly contribute fragments of the same packet. SAF-LoRa applies the same diversity principle to Reed--Solomon-coded LoRa telegrams and reconstructs from the union of CRC-valid fragment indices. Below the CRC boundary, a separate body of work improves reception using enhanced physical-layer processing, including Mc-LoRa~\cite{mclora2023}, concurrent interference cancellation~\cite{sic2021sigcomm}, NELoRa~\cite{nelora2021}, SRLoRa~\cite{srlora2023}, LoRaSeek~\cite{loraseek2025}, ConvLoRa~\cite{convlora2026}, and Canas~\cite{canas2026}. Such schemes can extract information from weak or collided signals and therefore operate before the hard CRC decision considered in our reconstruction model. On the feedback side, Todoli-Ferrandis \emph{et al.}~\cite{todoli2021} improve industrial LoRaWAN downlink robustness by piggybacking information on regular uplinks; SAF-LoRa similarly reuses the next uplink, but uses it to report a sequence-bound ACK outcome that feeds the gateway-selection process.
+
+\textbf{Positioning of SAF-LoRa.}
+Table~\ref{tab:related-work-comparison} summarizes the resulting design space. Existing work has separately addressed multi-gateway reception, advanced decoding, downlink-capacity management, and channel-aware adaptation. To the best of our knowledge, prior work has not jointly established the hard-decision limit of duplicate-fragment selection and then used tracked link state together with confirmed ACK outcomes to select the ACK gateway on commodity LoRa hardware. SAF-LoRa addresses this gap by separating multi-gateway reconstruction from post-reconstruction ACK-gateway scheduling and evaluating the resulting mechanism in both randomized hardware campaigns and paired simulations.
+
+\begin{comment}
+\emph{Recent multi-gateway and downlink work.} The decision closest to ours is studied by Caillouet \emph{et al.}~\cite{caillouet2024}, who show that downlink traffic alone can cost a LoRaWAN network up to 20\% of its capacity and that the gateway is the limiting factor because of its duty cycle and half-duplex operation; among the levers they examine is the choice of which gateway sends the downlink, selected to relieve that capacity constraint. Yang~\cite{yang2025} likewise assigns downlinks across gateways in large multi-gateway deployments, using Lyapunov optimization and learned policies for load balancing, and Al Mojamed~\cite{mojamed2023} directs each acknowledgment to the gateway with the most remaining duty-cycle headroom among those that heard the uplink, reporting better delivery than the SNR-based rule that network servers use by default. These works target gateway occupancy rather than the per-link delivery probability of an individual acknowledgment, and are evaluated in simulation. Two recent works act on other parts of the downlink: Aissaoui Ferhi~\cite{ferhi2025} learns when an acknowledgment is worth sending at all and suppresses the rest, and FDLoRa~\cite{fdlora2025} adds downlink capacity with full-duplex gateway hardware that sends concurrent downlinks through several gateways. Both change how many acknowledgments are sent or can be sent at once; our decision is which gateway carries each one on unmodified gateway hardware. On the receiver side, XGate~\cite{xgate2024} redesigns the gateway Rx chain for concurrent reception across logical channels, LoRaSeek~\cite{loraseek2025} and ConvLoRa~\cite{convlora2026} extend neural decoding to weak and collided signals, and B2LoRa~\cite{b2lora2025} combines repeated transmissions coherently for satellite IoT; all operate below the CRC gate and therefore address a different decision from ours. Closest to our data plane, Lahoud and Khawam~\cite{ts2025} analyse fragment-level macro-diversity for LR-FHSS, in which several gateways jointly collect the fragments of one packet; their treatment is analytical and concerns uplink reception, whereas the decision we study is the downlink that follows it. Yu \emph{et al.}~\cite{canas2026} resolve inter-logical-channel interference at the gateway for large-scale deployments, again on the uplink.
+
+\emph{Multi-gateway LoRa.} Earlier multi-gateway work exploits gateway diversity on the uplink: Petroni and Biagi~\cite{gw2022} mitigate interference and decode through gateway diversity in LoRaWAN, Citoni \emph{et al.}~\cite{gw2021dist} study the effect of inter-gateway distance, and Loubany \emph{et al.}~\cite{gw2023energy, gw2023throughput} optimize energy efficiency and throughput with multiple gateways. PCube scales concurrent transmissions using reception diversity~\cite{pcube2021}, and SRLoRa combines the signals of several gateways for neural weak-signal decoding~\cite{srlora2023}. These works improve what the gateways receive; none of them decides which gateway should answer. In industrial LoRaWAN, Todoli-Ferrandis \emph{et al.}~\cite{todoli2021} make downlink operation more robust by piggybacking information on regular uplinks, the same device-side mechanism we use for ACK receipts.
+
+\emph{Telegram splitting and fragment diversity.} Telegram splitting sends a message as several fragments spread in time so that bursty interference destroys only some of them. Its multi-gateway form, fragment-level macro-diversity across gateways, has recently been analysed for LR-FHSS~\cite{ts2025}; our data plane applies the same union-of-fragments idea to LoRa with Reed--Solomon erasure coding.
+
+\emph{Physical-layer decoding.} Physical-layer work decodes concurrent or weak transmissions: Mc-LoRa~\cite{mclora2023}, concurrent interference cancellation~\cite{sic2021sigcomm}, neural demodulation (NELoRa~\cite{nelora2021}, SRLoRa~\cite{srlora2023}, LoRaSeek~\cite{loraseek2025}, ConvLoRa~\cite{convlora2026}), and inter-channel interference resolution~\cite{canas2026}. Several of these approaches rely on soft-decision processing, enhanced receiver processing, or SDR-class hardware.
+
+\textit{Synthesis.} Prior work either improves decoding with enhanced receivers or combines multi-gateway receptions without separating hard-decision fragment selection from soft recovery (Table~\ref{tab:related-work-comparison}); to the best of our literature search, we found none that selects the ACK gateway from a tracked per-link delivery state refined by confirmed outcomes.\par \textit{Research gap.} Within the scope of our literature search, we did not identify prior work that shows that selecting among CRC-valid duplicates cannot improve availability, or uses link-state information and confirmed outcomes for downlink ACK gateway scheduling on commodity hardware. SAF-LoRa addresses both.
+\end{comment}
+
+\begin{table*}[t]
+\caption{Feature Comparison With Related Multi-Gateway LoRa/LPWAN Work. Reported Results Use Each Work's Own Metric.}
+\label{tab:related-work-comparison}
+\centering
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}p{2.1cm} p{2.0cm} c c c c c p{5.2cm}@{}}
+\toprule
+\textbf{Work} & \textbf{Technology} & \textbf{Multi-GW} & \textbf{Frag.\ split} & \textbf{ML} & \textbf{ACK sched.} & \textbf{HW} & \textbf{Reported result (own metric)} \\
+\midrule
+Petroni \& Biagi \cite{gw2022} & LoRaWAN & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ & Simulation study \\
+PCube \cite{pcube2021} & LoRa, hard-dec. & \checkmark & $\times$ & $\times$ & $\times$ & \checkmark & Concurrent-transmission scaling \\
+NELoRa \cite{nelora2021} & LoRa, soft-dec. & $\times$ & $\times$ & \checkmark & $\times$ & \checkmark & 1.84--2.35 dB SNR gain (1 GW) \\
+SRLoRa \cite{srlora2023} & LoRa, soft-dec. & \checkmark & $\times$ & \checkmark & $\times$ & \checkmark & 4.53--4.82 dB SNR gain (4 GW) \\
+Caillouet \emph{et al.} \cite{caillouet2024} & LoRaWAN & \checkmark & $\times$ & $\times$ & \checkmark & $\times$ & Downlink costs up to 20\% of capacity; gateway chosen for duty cycle \\
+Yang \cite{yang2025} & LoRaWAN & \checkmark & $\times$ & \checkmark & \checkmark & $\times$ & Downlink control and gateway load balancing \\
+Al Mojamed \cite{mojamed2023} & LoRaWAN & \checkmark & $\times$ & $\times$ & \checkmark & $\times$ & Duty-cycle-based ACK gateway choice vs.\ SNR-based rule (simulation) \\
+XGate \cite{xgate2024} & LoRa, hard-dec. & $\times$ & $\times$ & $\times$ & $\times$ & \checkmark & Concurrent reception across logical channels \\
+LoRaSeek \cite{loraseek2025} & LoRa, soft-dec. & $\times$ & $\times$ & \checkmark & $\times$ & \checkmark & 2.04--3.86 dB SNR gain \\
+Lahoud \& Khawam \cite{ts2025} & LR-FHSS, hard-dec. & \checkmark & \checkmark & $\times$ & $\times$ & $\times$ & Macro-diversity success-probability gain (analytical) \\
+\midrule
+\textbf{SAF-LoRa} & LoRa, hard-dec. & \checkmark & \checkmark\ (RS(5,3)) & \checkmark\ (HMM) & \checkmark & \checkmark & ACK share of non-interfered GW 50.6\%$\,\to\,$57.2\%; union +2.9~pp mean (0.0--6.1~pp); receipt reports for $>$97\% of ACKs \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{System Model}
+
+\subsection{Network and Reconstruction Model}
+\label{sec:network-model}
+$N$ nodes ($\mathcal{N}=\{1,\ldots,N\}$) encode each telegram with a systematic $(F,K)$ Reed--Solomon erasure code over $\mathrm{GF}(2^8)$: $F$ fragments are sent and any $K$ suffice. Two gateways ($\mathcal{G}=\{1,2\}$) independently try to receive each fragment, which reaches reconstruction only if it passes CRC. ``Hard-decision'' refers only to this availability decision: the receivers still report SNR and RSSI for every reception, valid or not, and the SNR drives the HMM of Section~\ref{sec:loop}. Let $r^g_{n,t,i}\in\{0,1\}$ indicate that gateway $g$ received fragment $i$ of telegram $t$ from node $n$ with a valid CRC. The server sees
+\begin{equation}
+R_{n,t} = \bigcup_{g} \{\, i : r^g_{n,t,i} = 1 \,\},
+\end{equation}
+and reconstruction succeeds if and only if $|R_{n,t}|\ge K$. All experiments use $F=5$, $K=3$.
+
+\subsection{Proposition 1: Duplicate Selection Cannot Improve Availability}
+\textbf{Statement.} Any rule that chooses among CRC-valid copies of the same fragment index leaves $R_{n,t}$, and hence reconstruction success, unchanged.
+
+\textit{Proof.} $R_{n,t}$ is a set of fragment indices, not of (fragment, gateway) pairs. If both gateways hold fragment $i$, index $i$ is in $R_{n,t}$ whichever copy is ``selected''. \hfill$
+
+\textit{Corollary 1.1.} For any gateway subset $\mathcal{G}'\subseteq\mathcal{G}$, $R^{\mathcal{G}'}_{n,t}\subseteq R_{n,t}$, so $\mathbf{1}[|R^{\mathcal{G}'}_{n,t}|\ge K]\le \mathbf{1}[|R_{n,t}|\ge K]$. Adding gateways can help; weighting among duplicates cannot.
+
+The result concerns availability; it does not cover undetected CRC errors or soft-decision receivers that combine failed receptions. Our hardware and simulator apply the same binary CRC-valid/invalid availability decision, so the useful place for state awareness is the ACK decision.
+
+\subsection{Proposition 2: ACK Capacity Under Duty Cycle}
+\label{prop:capacity}
+\textbf{Statement.} Let $D_g$ and $D_{\text{node}}$ be the gateway and node duty-cycle allowances, and $\tau_{\text{frag}}$, $\tau_{\text{ack}}$ the fragment and ACK airtimes. A node sending $F$ fragments at its duty limit has minimum telegram period $T_{\min}=F\tau_{\text{frag}}/D_{\text{node}}$, and one gateway can acknowledge at most
+\begin{equation}
+N_{\max} = \left\lfloor F\,\frac{D_g}{D_{\text{node}}}\,\frac{\tau_{\text{frag}}}{\tau_{\text{ack}}} \right\rfloor
+\label{eq:nmax}
+\end{equation}
+nodes per period.
+
+\textit{Proof.} In one period the gateway may transmit for $D_gT_{\min}$ seconds, i.e., $\lfloor D_gT_{\min}/\tau_{\text{ack}}\rfloor$ ACKs; substituting $T_{\min}$ gives~\eqref{eq:nmax}. \hfill$
+
+With SF7, 125~kHz, CR~4/5, an 8-symbol preamble and 15-byte implicit-header packets with CRC, fragments and zero-padded ACKs both take 46.336~ms (standard LoRa time-on-air expression). With illustrative allowances $D_g=10\%$ and $D_{\text{node}}=2.5\%$ (actual limits depend on the region and sub-band~\cite{mojamed2023}), $T_{\min}=9.27$~s and $N_{\max}=20$; at the measured mean period of 24.7~s one gateway can acknowledge 53 nodes (Fig.~\ref{fig:capacity}). ACK gateway choice therefore becomes a constrained decision as $N$ approaches $N_{\max}$ or when a quota binds (Section~\ref{sec:quota}). All results use the 868~MHz configuration.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_capacity.pdf}
+\caption{Per-gateway ACK capacity $N_{\max}$ vs.\ telegram period for the illustrative duty-cycle allowances of Proposition~2.}
+\label{fig:capacity}
+\end{figure}
+
+\subsection{Proposition 3: Optimal ACK Allocation}
+\label{prop:allocation}
+\textbf{Statement.} Let $q_{n,g}(t)$ be the probability that an ACK sent by gateway $g$ reaches node $n$, given the scheduler's information, and $a_{n,g}(t)\in\{0,1\}$ the assignment. The allocation that maximizes expected delivered ACKs solves
+\begin{equation}
+\max_{\{a_{n,g}\}} \sum_{n\in\mathcal{N}}\sum_{g\in\mathcal{G}} a_{n,g}q_{n,g}
+\;\;\text{s.t.}\;\; \sum_n a_{n,g}\le\kappa_g,\;\; \sum_g a_{n,g}\le 1,
+\label{eq:ack-alloc}
+\end{equation}
+where $\kappa_g$ is gateway $g$'s ACK budget in the window, a maximum-weight bipartite $b$-matching.
+
+\textit{Proof.} By linearity of expectation, $E[\sum a_{n,g}Y_{n,g}]=\sum a_{n,g}q_{n,g}$ for delivery indicators $Y_{n,g}$. \hfill$
+
+The hardware server assigns ACKs one at a time (Algorithm~\ref{alg:scheduler}), a sequential approximation of~\eqref{eq:ack-alloc}.
+
+\textit{Corollary 3.1.} For one node and two gateways,~\eqref{eq:ack-alloc} reduces to $g^*=\arg\max_g q_g$, the rule used by the state-aware policy. A blind policy achieves $(q_1+q_2)/2$, so the gain is
+\begin{equation}
+\Delta R = \frac{|q_1-q_2|}{2}.
+\label{eq:deltaR}
+\end{equation}
+
+\subsection{Proposition 4: Gain Under a Two-State Model}
+\label{prop:deltaR-belief}
+\textbf{Statement.} Suppose each gateway's downlink is GOOD or BAD with ACK-loss probabilities $\epsilon_G<\epsilon_B$ common to both gateways, and let $b_g$ be the probability that gateway $g$'s downlink is GOOD. Then $q_g=1-\epsilon_B+(\epsilon_B-\epsilon_G)b_g$, and from~\eqref{eq:deltaR},
+\begin{equation}
+\Delta R = \frac{\epsilon_B-\epsilon_G}{2}\,|b_1-b_2|.
+\label{eq:deltaR-belief}
+\end{equation}
+The gain grows with the GOOD/BAD contrast and with the asymmetry between gateways. In the uplink-primed SAF-LoRa variant, $b_g$ is estimated by the uplink HMM belief; in the confirmed-outcome variants it is further refined using ACK outcomes. Because misranking two very different gateways costs $|q_1-q_2|$ while misranking two similar ones costs little, we evaluate estimators by how well they rank outcomes (AUC).
+
+\section{SAF-LoRa Design and Implementation}
+\label{sec:implementation}
+
+\subsection{Testbed and Wire Format}
+The testbed has ten ESP32+SX1262 nodes, two ESP32+SX1262 gateways and a Raspberry Pi~4 server, at 868~MHz, SF7, 125~kHz, CR~4/5 \cite{lora_alliance_spec}. Uplink fragments and downlink ACKs use a fixed 15-byte implicit-header packet in a custom format. A fragment carries node ID (1~B), telegram ID (4~B), fragment ID (1~B), total fragment count (1~B, always 5) and an 8-byte RS-encoded payload. An ACK carries a magic byte, node ID, telegram ID and success flag (7~B, zero-padded to 15~B).
+
+\subsection{How SAF-LoRa Handles Interference, Acknowledgment and Feedback}
+\label{sec:loop}
+\textit{Interference on the data plane.} Each telegram is split into five RS-coded fragments spread in time, so a burst that destroys up to two fragments is absorbed by the code, and every gateway contributes its CRC-valid fragments to one union. By Corollary~1.1, adding a gateway can only raise availability, so interference affecting one gateway can be mitigated when the other gateway retains usable reception.
+
+\textit{Interference on the feedback plane.} Gateways also forward CRC-failed receptions. Their payload is never used for reconstruction, but their SNR, RSSI and timestamp are kept, because a failed CRC is itself evidence of interference. A two-state hidden Markov model (HMM) with fixed parameters ($P(\text{G}\!\to\!\text{G})=0.85$, $P(\text{B}\!\to\!\text{B})=0.60$, $\mu_{\text{G}}=12.5$~dB, $\sigma_{\text{G}}=1.5$~dB, $\mu_{\text{B}}=5.0$~dB, $\sigma_{\text{B}}=4.0$~dB, set before the campaigns) computes the filtering posterior $\hat p(t)=P(S(t)=\text{GOOD}\mid o_{1:t})$. The HMM uses SNR as its observation; RSSI and timestamps are retained for logging and subsequent analysis. CRC-valid fragments update a per-(node, gateway) belief; the SNR observations of CRC-failed receptions update a per-gateway belief that acts as the prior for pairs without recent history. An interfered gateway therefore loses belief quickly, and its ACKs are redirected.
+
+\textit{Acknowledgment under an airtime budget.} For each reconstructed telegram, the server picks one gateway under a rolling per-gateway airtime budget (Algorithm~\ref{alg:scheduler}). Sending one ACK per telegram instead of broadcasting halves the downlink airtime, and ranking the gateways spends that airtime where it is most likely to arrive.
+
+\textit{Confirmed-outcome feedback.} Following the idea of piggybacking status on regular uplinks~\cite{todoli2021}, nodes report whether the previous ACK arrived by packing a 2-bit receipt status and a 3-bit sequence tag into the unused upper five bits of the one-byte total-fragment field, whose total-fragment count is always 5, of their next uplink. The receipt status occupies feedback bits $[1{:}0]$ and the sequence tag feedback bits $[4{:}2]$; in the wire byte the status is therefore at bits $[4{:}3]$, the tag at bits $[7{:}5]$, and bits $[2{:}0]$ keep the total-fragment count. The tag is the previous telegram ID modulo~8: on receiving a report on telegram $t$, the server accepts it only if the tag equals $(t-1)\bmod 8$ and then matches it to the pending ACK of that node for telegram $t-1$; unmatched or stale tags are discarded. No additional uplink packet is sent; the cost is a receive window at the node (Section~\ref{sec:results-premise}). The sequence tag binds each report to its ACK, and the server labels every ACK as confirmed success, confirmed failure, or unavailable (no accepted report within 90~s).
+
+\subsection{Scheduling Policies and SAF-LoRa Variants}
+\label{sec:scheduling}
+We group the evaluated policies by the role they play. The \emph{external baselines} are \textbf{broadcast} (both gateways), \textbf{random}, \textbf{round-robin} (per-node alternation) and \textbf{SNR-greedy} (highest uplink SNR, the usual network-server heuristic~\cite{mojamed2023}); these are the policies a deployed network server might run today. The \emph{component ablations} isolate the two terms of the proposed score~\eqref{eq:blend}: \textbf{belief-only} (highest HMM belief) uses the uplink-state term alone, and \textbf{EWMA} (highest EWMA of confirmed outcomes, available once receipts exist) uses the confirmed-outcome term alone. Comparing SAF-LoRa-F with these two answers what each information source contributes and what combining them achieves. The SAF-LoRa variants are:
+\begin{itemize}
+\item \textbf{SAF-LoRa} (uplink-primed): $s_{n,g}(t)=\hat p_{n,g}(t)$, used when no receipt feedback exists; this is the variant of the interference-redirection runs (Section~\ref{sec:results-interference}) and of the main simulation benchmark.
+\item \textbf{SAF-LoRa-F} (fixed blend), used in the confirmed-outcome hardware campaigns (Sections~\ref{sec:h1h4}--\ref{sec:quota}):
+\begin{equation}
+s_{n,g}(t)=(1-w_{n,g})\,\hat p_{n,g}(t)+w_{n,g}\,\mathrm{EWMA}_{n,g}(t),
+\label{eq:blend}
+\end{equation}
+with $w_{n,g}=n_{n,g}/(n_{n,g}+5)$ and $n_{n,g}$ the number of confirmed outcomes. It equals SAF-LoRa before any report arrives.
+\item \textbf{Adaptive SAF-LoRa}: Bayesian model averaging of the belief and the EWMA (Section~\ref{sec:sim-robust}), evaluated in simulation as a confirmed-outcome extension.
+\end{itemize}
+Ties are broken uniformly at random.
+
+\begin{algorithm}[!t]
+\caption{Server-Side Downlink Scheduling}
+\label{alg:scheduler}
+\SetAlgoLined
+\KwIn{Node $n$, gateways $\mathcal{G}$, per-gateway airtime budget}
+\KwOut{Set of gateways that send the ACK}
+$\mathcal{A} \leftarrow \{g \in \mathcal{G} : \text{budget}(g) \text{ not exhausted}\}$\;
+\lIf{$\mathcal{A} = \emptyset$}{\Return $\emptyset$}
+\Switch{policy}{
+    \lCase{broadcast}{chosen $\leftarrow \mathcal{A}$}
+    \lCase{random}{chosen $\leftarrow$ uniform $g \in \mathcal{A}$}
+    \lCase{round-robin}{chosen $\leftarrow \mathcal{A}[i_n \bmod |\mathcal{A}|]$}
+    \lCase{SNR-greedy}{chosen $\leftarrow \arg\max_{g\in\mathcal{A}} \mathrm{SNR}_{n,g}$}
+    \lCase{belief-only}{chosen $\leftarrow \arg\max_{g\in\mathcal{A}} \hat p_{n,g}$}
+    \lCase{EWMA}{chosen $\leftarrow \arg\max_{g\in\mathcal{A}} \mathrm{EWMA}_{n,g}$}
+    \lCase{SAF-LoRa(-F)}{chosen $\leftarrow \arg\max_{g\in\mathcal{A}} s_{n,g}(t)$}
+}
+Record airtime for each $g\in$ chosen\;
+\Return chosen\;
+\end{algorithm}
+
+\subsection{Discrete-Event Simulator}
+\label{sec:sim}
+A Python simulator models each link as an independent two-state Gilbert--Elliott burst-error channel producing SNR readings ($P(\text{G}\!\to\!\text{B})=0.05$, $P(\text{B}\!\to\!\text{G})=0.3$, uplink loss 3\% GOOD and 50\% BAD, stationary GOOD probability $\pi=0.857$). A fragment is corrupted with probability $1/(1+\exp((\text{SNR}_{\text{dB}}-7)/2))$, and the simulator applies the same binary CRC-valid/invalid availability abstraction used by the hardware. The simulator implements the same policies and HMM as the server. Its main benchmark has no receipt feedback, so it evaluates the uplink-primed SAF-LoRa. A lost uplink counts as the lowest possible SNR for SNR-greedy, and ties are broken uniformly at random, as on hardware. The \emph{oracle} selects the gateway with the highest true instantaneous delivery probability. All policies see the same channel realizations per seed, so differences are paired (95\% CIs, 50 seeds unless stated).
+
+\section{Hardware Evaluation}
+
+\subsection{Setup and Baseline}
+\label{sec:results-policy-clean}
+\textit{Campaign overview.} Campaign~1 (Section~\ref{sec:results-interference}) compares uplink-primed SAF-LoRa with the clean baseline under controlled interference; Campaign~2 (Section~\ref{sec:h1h4}) compares SAF-LoRa-F, EWMA, round-robin and random with confirmed outcomes; Campaign~3 (Section~\ref{sec:sessions}) compares SAF-LoRa-F with SNR-greedy, belief-only and EWMA in three sessions; Campaign~4 (Section~\ref{sec:geom2}) is a pre-specified twelve-block campaign in a second gateway geometry that validates the gain model directly; a quota sweep (Section~\ref{sec:quota}) completes the hardware study. The interferer is an ESP32+SX1262 board placed near one gateway, transmitting a pseudo-random ON/OFF pattern (mean ON 17.3~s, OFF 39.0~s, 30.8\% duty); in later campaigns it reports its state over WiFi, timestamped on the server clock, which gives a ground truth for the HMM. Runs use a randomized block design so that all policies in a block see the same conditions. Without interference the system reconstructed 79.7\% $\pm$ 2.4\% of telegrams (ten 8-minute runs), with per-node rates of 76--85\%. With symmetric gateways, SAF-LoRa and round-robin both sent 50.6\% of ACKs through GW1, as~\eqref{eq:deltaR} predicts when $q_1=q_2$; broadcast gave 52.1\% because it falls back to one gateway when the other's budget is momentarily exhausted.
+
+\subsection{Interference-Driven ACK Redirection}
+\label{sec:results-interference}
+With the interferer near GW2, the mean HMM belief was lower for GW2 (0.584) than for GW1 (0.676), and SAF-LoRa sent 57.2\% $\pm$ 2.1\% of its ACKs through GW1, the gateway not directly exposed to the interferer, up from the 50.6\% clean baseline (+6.6~pp) (an ACK gateway-selection share, not an ACK delivery rate). The shift appeared in every run (55.9\%, 59.6\% and 56.2\%, three 20-minute runs; Fig.~\ref{fig:redirection}(a)); since a belief-driven chooser drifts 6~pp from parity by chance in about one short run in ten in simulation, the consistency across all three runs provides supporting evidence of interference-driven redirection. The same behaviour held in the larger eight-block campaign (Fig.~\ref{fig:redirection}(b)): SAF-LoRa-F sent 59.8\% (interferer OFF) and 57.1\% (ON) of its ACKs through GW1, the gateway that delivered more often (0.559 against 0.414 confirmed delivery, 3{,}514 confirmed ACKs), whereas round-robin and random stayed within 1.5~pp of parity. With a 30.8\%-duty interferer, reconstruction remained at 69.7\% (68.4--71.7\%, against 79.7\% clean), consistent with the resilience provided by the RS-coded gateway union.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_redirection.pdf}
+\caption{ACK redirection toward the gateway not directly exposed to the interferer (GW1); bars show ACK gateway-selection share, not ACK delivery. (a) Uplink-primed SAF-LoRa in three 20-minute interference runs vs.\ the clean baseline. (b) Eight-block confirmed-outcome campaign: GW1 share by policy and interferer state (OFF/ON); dotted line: 50\%.}
+\label{fig:redirection}
+\end{figure}
+
+\subsection{Measured Gateway Diversity}
+\label{sec:results-diversity}
+Proposition~1 says duplicate copies add nothing; it does not say how often the gateways receive \emph{different} fragments. We measured this from the receiver logs of 17 runs (Fig.~\ref{fig:diversity}), which record every CRC-valid fragment per gateway. These runs span different experimental configurations and are not 17 independent repetitions of a single condition. For each telegram with at least one CRC-valid fragment we form the sets $\mathcal{F}_1,\mathcal{F}_2$ of distinct fragment indices per gateway. Reconstruction from the logs matched the server's own records exactly in the run we cross-checked at fragment level (6 nodes: 406 of 540 telegrams).
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig_diversity.pdf}
+\caption{Gateway diversity from the receiver logs of 17 hardware runs ($F=5$, $K=3$; node sweep with 2--10 nodes, interference runs C, C2, D1, D2, and policy/duty-cycle runs of sessions A and B). (a) Reconstruction from each gateway alone and from the union of distinct fragment indices. (b) Union gain over the better single gateway.}
+\label{fig:diversity}
+\end{figure*}
+
+The union benefit comes from recovering different fragment indices across gateways, not from selecting between duplicate copies of the same index. Pooling the 8{,}594 telegrams across the 17 runs, 86\% of the distinct CRC-valid fragment indices observed at least once were observed at both gateways (77--95\% per run). The union reconstructs 0.0--6.1~pp more telegrams than the better single gateway (mean and median 2.9~pp), and it averages 4.3~pp in the interference runs C, C2 and D against 2.6~pp elsewhere, the direction expected when one gateway is degraded and the other is not (with one run per configuration, this is an observation rather than a controlled comparison). The gain comes almost entirely from telegrams that one gateway decodes and the other does not; only 10 telegrams (0.1\%) required fragments from both. In this geometry, gateway diversity therefore contributes mainly through alternate complete reconstruction at the second gateway rather than through frequent fragment-level complementarity. The second gateway therefore acts mainly as a backup receiver that takes over when interference degrades the first, which is exactly the situation in which ACK routing must also switch gateways. By Proposition~1, reception does not depend on the ACK policy, so the policy label of a run is not a factor here. In the node sweep, reconstruction stayed between 75.2\% and 86.3\% from 2 to 10 nodes.
+
+\subsection{The Feedback Channel}
+\label{sec:results-premise}
+\textit{Availability, latency and cost.} In the later policy sessions, receipt reports arrived for 97.5--98.2\% of ACKs, a median of 10.7~s after the ACK (90th percentile 12.5--13.0~s). Each ACK takes 46.336~ms and every policy sent one ACK per decision, so ACK airtime was 2.4--2.5\% of run time in the eight-block campaign and 2.9--3.0\% in session~B, identical across policies. The receipt mechanism adds no uplink packet; its cost is the node's receive window, on average 4.2~s per telegram cycle (about 17\% of a 24.7~s period, 2{,}875 cycles), the same for every policy. Node energy consumption associated with this receive window was not measured in this study.
+
+\textit{HMM response time.} Against the server-synchronized interferer log, we measured the time until the mean gateway belief crossed a threshold of 0.75, close to the midpoint (0.73) of the OFF (0.84) and ON (0.62) means (Fig.~\ref{fig:hmm}(a)). For OFF$\to$ON transitions the belief crossed in 87\% of 125 cases in the eight-block campaign (median 6.9~s, interquartile range 0.7--10.3~s) and in 97\% of 33 cases in session~B (median 2.9~s, 1.6--4.3~s). For ON$\to$OFF transitions it crossed in 100\% of 152 and 34 cases (medians 0.8~s and 2.4~s). The belief ranks the interferer state with AUC 0.658 in the eight-block campaign and 0.692 (GW1) and 0.679 (GW2) in the later sessions (Fig.~\ref{fig:hmm}(b)).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_hmm.pdf}
+\caption{HMM tracking of the synchronized interferer. (a) Bars: median time for the mean gateway belief to cross 0.75 after OFF$\to$ON and ON$\to$OFF transitions; error bars: interquartile range (available for OFF$\to$ON only). (b) AUC of the belief for the interferer state.}
+\label{fig:hmm}
+\end{figure}
+
+\textit{Does the state predict ACK delivery?} On the 3{,}514 confirmed ACKs of the eight-block campaign, the HMM belief achieves AUC 0.666 for confirmed delivery. Over a larger pool of 5{,}372 records across campaigns, the available uplink predictors reach lower AUCs (Fig.~\ref{fig:auc}); because the populations and the predictors' availability differ by measurement type, this comparison is descriptive rather than a strictly paired ranking. The belief is informative, and confirmed outcomes provide direct information about downlink reception that is not directly available from the uplink observations, which is why SAF-LoRa-F blends them~\eqref{eq:blend}.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{FIG_AUC!.png}
+\caption{AUC of the HMM state belief and of uplink-derived measurements for downlink ACK delivery (dashed line: chance level, AUC\,=\,0.5). Green: HMM belief on the 3{,}514 confirmed ACKs of the eight-block campaign. Blue and grey: pooled over 5{,}372 records across campaigns; predictor availability differs by measurement type, so the comparison is descriptive, not paired.}
+\label{fig:auc}
+\end{figure}
+
+\subsection{Confirmed-Outcome Campaign}
+\label{sec:h1h4}
+With receipt reporting enabled, eight blocks each ran SAF-LoRa-F, EWMA, round-robin and random once, in randomized order, under continuous interference and identical traffic. Of 4{,}299 ACKs, 1{,}738 were confirmed delivered and 1{,}776 confirmed lost; delivery is computed over the 3{,}514 reported ACKs (Fig.~\ref{fig:campaign}(a)). The observed policy means lay within a 2.8~pp range (0.480--0.508), and all percentages are conditional on reported ACKs (785 of the 4{,}299 ACKs, 18.3\%, have no receipt report, so 81.7\% were classified in this campaign; receipt reporting improved to 97.5--98.2\% in the later policy sessions of Section~\ref{sec:sessions} and to 97.3--98.1\% in Section~\ref{sec:geom2}, and the abstract's figure of more than 97\% refers to those later sessions); the block count is insufficient to establish whether these small differences are systematic. Reconstruction remained within 72.5--76.4\% across the policies, consistent with Proposition~1 that ACK routing does not alter fragment availability. With one run per policy per block, the available block count is insufficient to establish statistical significance for differences of a few percentage points, and none of the paired comparisons reached $p<0.05$.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_campaign.pdf}
+\caption{Eight-block confirmed-outcome campaign. (a) Confirmed ACK delivery and reconstruction per policy (EW: EWMA, Ra: random, RR: round-robin, SAF: SAF-LoRa-F; mean $\pm$ SD over blocks). (b) Confirmed delivery per gateway, split by the server-synchronized interferer state.}
+\label{fig:campaign}
+\end{figure}
+
+The campaign also shows how interference reaches the ACK. Under blind round-robin assignment, GW1 delivered 0.574 and GW2 0.438, so Corollary~3.1 and~\eqref{eq:deltaR} give a maximum state-aware gain of 6.8~pp for these measured gateway delivery probabilities (a theoretical bound, not an achieved gain), and SAF-LoRa-F did shift its ACKs toward GW1 (Fig.~\ref{fig:redirection}(b)). While the interferer was ON, however, confirmed delivery fell on \emph{both} gateways (Fig.~\ref{fig:campaign}(b)), suggesting that, in this geometry, the laboratory interferer also substantially affected ACK reception at the nodes. Gateway choice can route around interference near a gateway, but not around interference at the receiving node; this also bounds the gain available to any gateway-selection policy here. Because receipt reports travel on the next uplink, which the interferer also degrades, the ON-state figures partly reflect report loss.
+
+\subsection{Policy Sessions: External Baselines and Component Ablations}
+\label{sec:sessions}
+Three further sessions compared policies in randomized block order under continuous interference, with a geometry in which the gateways differed more in downlink quality (under round-robin in session~A, GW1 delivered 0.596 and GW2 0.375). Session~A (blocks 3--6) compared round-robin, SNR-greedy and SAF-LoRa-F; session~B (blocks 11--14) compared SAF-LoRa-F against both component ablations, belief-only and EWMA; session~C (blocks 21--22) ran round-robin, SNR-greedy, SAF-LoRa-F and EWMA. Sessions A and C therefore carry the comparison against external baselines, while sessions B and C carry the component ablations; the two questions are kept separate throughout because they are answered by different runs. Each run lasted four minutes (roughly 100--155 ACK decisions) and started with empty EWMA state. These sessions use a different gateway geometry and traffic realization from the eight-block campaign of Section~\ref{sec:h1h4}, so their absolute delivery levels are not directly comparable with Fig.~\ref{fig:campaign}; only within-session, within-block comparisons are meaningful. Table~\ref{tab:sessions} lists every policy that ran in each session, and Fig.~\ref{fig:paired} the paired block differences.
+
+\begin{table}[t]
+\caption{Confirmed ACK Delivery, GW1 Share and Delivery by Interferer State at Send, per Session (Mean Over Blocks; A: Blocks 3--6, B: 11--14, C: 21--22)}
+\label{tab:sessions}
+\centering
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Session & Policy & Delivery & GW1 share & OFF & ON \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{External baselines}}\\
+A & Round-robin & 0.490 & 51.6\% & 0.609 & 0.224 \\
+A & SNR-greedy  & 0.527 & 55.6\% & 0.601 & 0.307 \\
+C & Round-robin & 0.544 & 51.1\% & 0.650 & 0.188 \\
+C & SNR-greedy  & 0.563 & 49.0\% & 0.623 & 0.321 \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Component ablations of \eqref{eq:blend}}}\\
+B & Belief-only & 0.498 & 43.5\% & 0.585 & 0.291 \\
+B & EWMA        & 0.609 & 66.0\% & 0.691 & 0.378 \\
+C & EWMA        & 0.628 & 69.6\% & 0.710 & 0.361 \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Proposed}}\\
+A & SAF-LoRa-F  & \textbf{0.607} & 62.2\% & \textbf{0.699} & \textbf{0.315} \\
+B & SAF-LoRa-F  & 0.553 & 60.2\% & 0.644 & 0.280 \\
+C & SAF-LoRa-F  & 0.495 & 56.1\% & 0.542 & 0.294 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In session~A, SAF-LoRa-F delivered 60.7\% of confirmed ACKs against 52.7\% for SNR-greedy and 49.0\% for round-robin (+11.7~pp), and it led in both interferer states. It achieved this by selecting the better-performing gateway most frequently, with a GW1 selection share of 62.2\%, and it also delivered more within the gateway-conditioned measurements, consistent with the joint use of the uplink belief and confirmed outcomes. Across the six blocks in which both ran (sessions A and C), SAF-LoRa-F led round-robin by $+6.1$~pp and SNR-greedy by $+3.0$~pp (Fig.~\ref{fig:paired}, upper group). The session-A lead did not carry over to session~C, where SAF-LoRa-F delivered 49.5\% against 56.3\% for SNR-greedy and 54.4\% for round-robin, and with at most six paired blocks none of the paired comparisons reached the 0.05 level (observed $p$ between 0.096 and 0.556, recomputed here directly from the block-level records); the small sample limits resolution of differences of a few percentage points.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_paired.pdf}
+\caption{Mean paired-block differences in confirmed delivery with 95\% paired-$t$ CIs. Upper group: SAF-LoRa-F against the external baselines. Lower group: the component ablations of~\eqref{eq:blend}. Session labels indicate the blocks included in each comparison, so the number of paired blocks differs between rows (two to six).}
+\label{fig:paired}
+\end{figure}
+
+\emph{Component ablations.} The EWMA ablation isolates the confirmed-outcome term of~\eqref{eq:blend}, a signal that exists only because of SAF-LoRa's receipt mechanism. It delivered 60.9\% in session~B and 62.8\% in session~C, ahead of the belief-only ablation by $+11.1$~pp and of every external baseline in the sessions where both ran ($+8.4$~pp over round-robin and $+6.5$~pp over SNR-greedy in session~C); it also delivered 0.361 while the interferer was ON, against 0.188 for round-robin. The two ablations therefore behave very differently: the uplink-state term alone is the weakest policy in session~B, while the confirmed-outcome term alone is the strongest in the evaluated hardware sessions, and in session~B the fixed blend of~\eqref{eq:blend} falls between them. This shows that confirmed ACK outcomes provide direct information about downlink reception that is not directly available from the uplink observations, and that a fixed blending weight does not automatically extract it: after 100--155 decisions spread over 20 node--gateway pairs, $w=n/(n+5)$ still leaves about half the score on the uplink belief. It is this ablation result that motivates the adaptive-fusion study of Section~\ref{sec:sim-robust}, which examines how the relative weight of the two sources should change across channel conditions. Reconstruction lay between 82.5\% and 87.3\% for every policy and session.
+
+\subsection{Second-Geometry Campaign: Direct Validation of the Gain Model}
+\label{sec:geom2}
+The sessions of Section~\ref{sec:sessions} resolve policy differences only to a few
+percentage points. To test the selection mechanism itself at a larger block count, we ran a
+further campaign in a second gateway geometry, with the interferer placed close to GW1 so
+that the roles of the two gateways are reversed with respect to sessions A--C. The
+configuration, block count, run length, analysis and the fixed blending weight
+of~\eqref{eq:blend} were written down before the campaign started and were not changed
+afterwards. Twelve paired blocks each ran SAF-LoRa-F, EWMA, round-robin and SNR-greedy once
+in randomized order, four minutes per run, giving 48 runs and 7{,}062 confirmed outcomes.
+Receipt reports arrived for 97.3--98.1\% of ACKs and were balanced across policies
+(97.3\% for SAF-LoRa-F against 98.1\% for round-robin), so the delivery comparisons are not
+distorted by differential report loss.
+
+\emph{The interferer produces the intended asymmetry.} Measured under round-robin, which
+assigns blindly and therefore provides a blind reference for the channel, the two gateways are
+symmetric with the interferer disconnected (GW1 0.726, GW2 0.763 over 380 confirmed ACKs;
+a second baseline gives 0.678 and 0.660), so~\eqref{eq:deltaR} predicts a maximum
+state-aware gain of only 0.9--1.8~pp in the clean condition. With the interferer active,
+GW1 falls to 0.646 while GW2 holds at 0.772 over 1{,}753 confirmed ACKs
+(Fig.~\ref{fig:geom2}(a)), a gap of 12.6~pp and hence a ceiling of 6.3~pp
+from~\eqref{eq:deltaR}. The interference is therefore real, asymmetric, and degrades the
+gateway it was placed beside.
+
+\emph{Every state-aware signal redirects toward the healthy gateway, to differing degrees.} Round-robin sent 48.3\% of
+its ACKs through the healthy gateway, SNR-greedy 54.9\%, SAF-LoRa-F 57.0\% and EWMA 61.4\%
+(Fig.~\ref{fig:geom2}(b)), i.e.\ shifts of 6.6, 8.7 and 13.1~pp relative to round-robin, the
+blind reference. The observed ordering is consistent with the information available to each
+policy: the blind policy does not move, the uplink-derived signal moves moderately, and
+the confirmed-outcome signal moves furthest.
+
+\emph{The gain model predicts the measured delivery.} A policy that shifts a fraction
+$\Delta\sigma$ of its ACKs from the weaker to the stronger gateway gains
+$\Delta\sigma\,(q_2-q_1)$ in expected delivery. With the measured $q_2-q_1=12.6$~pp, the
+observed share shifts predict gains over round-robin of $0.83$~pp (SNR-greedy), $1.10$~pp
+(SAF-LoRa-F) and $1.65$~pp (EWMA); the measured gains are $-0.21$, $-0.04$ and $+1.32$~pp
+(Fig.~\ref{fig:geom2}(c)), every one of them within 1.3~pp of prediction and within its 95\%
+confidence interval. This is a direct hardware check of~\eqref{eq:deltaR}: the gain
+available to a gateway-selection policy is set by the product of the asymmetry it can see
+and the share it is able to move, not by the asymmetry alone.
+
+\emph{Why the policies tie overall.} The same calculation explains the absence of a
+significant overall difference. All four policies lay within 1.5~pp of each other
+(round-robin 0.706, SNR-greedy 0.704, SAF-LoRa-F 0.706, EWMA 0.719) with every paired
+comparison at $p\ge0.47$. The 6.3~pp ceiling assumes perfect selection; at the share shifts
+actually achieved, the gain on offer is 1--2~pp, while twelve paired blocks with a
+paired-difference standard deviation of 6.1~pp resolve about $\pm4$~pp. Detecting a 1.3~pp
+effect at 80\% power would require roughly 170 blocks. The campaign therefore confirms the
+mechanism quantitatively while showing that, in a geometry of this asymmetry, the resulting
+delivery difference is below what a testbed campaign of practical length can resolve; the
+larger effects of Table~\ref{tab:sessions} arise in the more strongly asymmetric geometry of
+sessions A--C. Restricted to ACKs sent while the interferer was ON, SAF-LoRa-F recorded the
+highest observed delivery (0.601 against 0.536--0.583), consistent with
+Table~\ref{tab:sessions}, but with roughly 17 confirmed ACKs per block in that subset the
+comparison is observational.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig_geom2.pdf}
+\caption{Second-geometry campaign (12 paired blocks, 4 policies, interferer near GW1).
+(a) Per-gateway confirmed delivery under round-robin with the interferer disconnected and
+active; the interferer degrades GW1 only. (b) Share of ACKs sent through the healthy
+gateway, by policy; dotted line: parity. (c) Delivery gain over round-robin predicted by
+$\Delta\sigma\,(q_2-q_1)$ from the measured share shift, against the observed paired-block
+gain with 95\% CI.}
+\label{fig:geom2}
+\end{figure*}
+
+\subsection{ACK Scarcity}
+\label{sec:quota}
+A hard per-gateway quota (ACKs per 60~s), independent of the airtime budget, was imposed under SAF-LoRa-F and interference (Table~\ref{tab:quota-hw}). Rejections rise from 0\% at quotas $\ge30$ to 86.5\% at quota~2, providing a hardware demonstration of scheduler operation under increasingly binding ACK quotas; the sweep shows scarcity, not a delivery gain. The three binding quotas were subsequently repeated twice each under the same interference, giving 889 further ACK candidates. The two repetitions agree to within 0.4~pp at every quota (55.5\% and 55.9\% at quota~8, 78.2\% and 78.1\% at quota~4, 88.3\% and 87.9\% at quota~2), and reproduce the monotone trend of the first sweep, so the behaviour under a binding quota is repeatable rather than an artefact of a single run. In a three-policy comparison at quota~8 (blocks 31--32, 3-minute runs), all policies sent exactly 96 of 202--217 candidates, split 50.0\% per gateway, because the quota exhausts both gateways; confirmed delivery was 0.517 (EWMA), 0.514 (round-robin) and 0.505 (SAF-LoRa-F). Under a binding quota the gateway choice is forced, so selection matters less than which nodes receive the slots.
+
+\begin{table}[t]
+\caption{Hardware ACK-Quota Sweep (SAF-LoRa-F, Under Interference)}
+\label{tab:quota-hw}
+\centering
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+\multirow{2}{*}{Quota (ACKs/60~s)} & \multicolumn{3}{c}{First sweep} & Repeats \\
+\cmidrule(lr){2-4}\cmidrule(l){5-5}
+ & Candidates & Sent & Rejected & Rejected (rep.\ 1, 2) \\
+\midrule
+Unrestricted & 149 & 149 & 0.0\% & --- \\
+30 & 238 & 238 & 0.0\% & --- \\
+15 & 155 & 128 & 17.4\% & --- \\
+8 & 158 & 80 & 49.4\% & 55.5, 55.9\% \\
+4 & 56 & 16 & 71.4\% & 78.2, 78.1\% \\
+2 & 296 & 40 & 86.5\% & 88.3, 87.9\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Simulation Evaluation}
+\label{sec:sim-results}
+
+\subsection{Combining Check and Scheduling Response}
+\label{sec:results-sim}
+Three duplicate-selection strategies (trust every valid copy, prefer the copy with higher belief, and a genie with ground-truth state) produced identical outcomes for every telegram over 10--60 nodes (telegram error rate 0.544--0.565, 10 seeds each) and in a separate 10{,}000-observation run, as Proposition~1 requires. In the scheduling-response experiment (15 seeds; here the interfered gateway is indexed GW1), SAF-LoRa's share through the interfered gateway fell monotonically with severity, from 49.1\% at 0~dB to 9.5\% at 5~dB, while round-robin and broadcast stayed at 50.0\% (Table~\ref{tab:sim-response}). The 5.0~pp simulation shift in ACK share through the interfered gateway at 1~dB is comparable in magnitude to the 6.6~pp gateway-share shift observed in hardware. Against the simulator's latent state, the HMM classifies GOOD with 87.3\% accuracy, above the 72.7\% stationary baseline.
+
+\begin{table}[t]
+\caption{Simulated ACK Share Through the Interfered Gateway vs.\ Interference Severity (15 Seeds; Round-Robin and Broadcast: 50.0\%)}
+\label{tab:sim-response}
+\centering
+\begin{tabular}{@{}cc@{}}
+\toprule
+Severity (dB) & SAF-LoRa share (mean $\pm$ SD) \\
+\midrule
+0.0 & 49.1\% $\pm$ 9.6 \\
+0.5 & 46.7\% $\pm$ 9.1 \\
+1.0 & 44.1\% $\pm$ 9.3 \\
+2.0 & 32.6\% $\pm$ 8.0 \\
+5.0 & 9.5\% $\pm$ 4.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Benchmark Across Interference Severity}
+\label{sec:sim-extended}
+Delivery probability is 0.75 (GOOD) or 0.25 (BAD), minus 0.04 per dB of interference on the interfered gateway. We define the normalized gap recovery $G_{\text{norm}}=(D_\pi-D_{\text{RR}})/(D_{\text{oracle}}-D_{\text{RR}})$. Across seven severities (Fig.~\ref{fig:benchmark}), SAF-LoRa recovers 82--99.5\% of the round-robin-to-oracle gap (99.5\% at 0~dB), against 81--93\% for SNR-greedy and 11--51\% for EWMA, which lacks fresh uplink information. SAF-LoRa has higher mean delivery than SNR-greedy at every severity up to 2~dB (paired difference $+0.40$, $+0.36$, $+0.25$, $+0.17$ and $+0.13$~pp, 95\% CI $\pm0.11$--$0.14$~pp); at 3 and 5~dB, where strong interference makes the raw SNR itself a clear signal, SNR-greedy is ahead by 0.20 and 0.76~pp. SAF-LoRa's advantage is therefore largest at low-to-moderate interference, while SNR-greedy becomes competitive at severe interference, where the instantaneous SNR is itself a strong signal. Random was also simulated as a control; it remained within 0.25~pp of round-robin.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig_benchmark.pdf}
+\caption{Simulation benchmark vs.\ interference severity (10 nodes, 200 rounds, 50 paired seeds, no receipt feedback). (a) ACK delivery. (b) Normalized oracle-gap recovery $G_{\text{norm}}$. (c) Paired difference SAF-LoRa $-$ SNR-greedy with 95\% CI.}
+\label{fig:benchmark}
+\end{figure*}
+
+\subsection{Gateway Asymmetry and Proposition 4}
+Gateway~1 has stationary GOOD probability $\pi$ and gateway~2 $\pi-\Delta p$, so $(\epsilon_B-\epsilon_G)/2=0.25$. SAF-LoRa's gain over round-robin grows monotonically from 5.83~pp at $\Delta p=0$ to 12.73~pp at $\Delta p=0.4$ and stays within 0.54~pp of the oracle throughout (Fig.~\ref{fig:sim-asym}). Using the stationary difference $\Delta p$ directly as the belief gap in~\eqref{eq:deltaR-belief} gives a slope of 25~pp per unit $\Delta p$. A scheduler that ranks on the current state, however, holds a decision-time belief gap equal to the probability that the two gateway states differ, $2\pi(1-\pi)+(2\pi-1)\Delta p$ for independent gateways, so~\eqref{eq:deltaR-belief} predicts a slope of $25(2\pi-1)=17.9$~pp. The measured slopes are $17.1\pm0.9$ for SAF-LoRa (96\% of this prediction) and $18.3\pm0.7$ for the oracle, which uses no estimator. We derived the decision-time refinement after the stationary-gap comparison; the oracle's agreement shows that it reflects the model rather than the estimator.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_asymmetry.pdf}
+\caption{Incremental gain of SAF-LoRa and the oracle over round-robin (relative to $\Delta p=0$) vs.\ gateway asymmetry, with the two Proposition~4 predictions; 95\% paired CIs, 50 seeds.}
+\label{fig:sim-asym}
+\end{figure}
+
+\subsection{ACK Quota}
+At $\Delta p=0.2$, SAF-LoRa's gain over round-robin among sent ACKs is $+9.4$~pp without a quota and remains $+4.8$ to $+6.4$~pp at every quota from 30 down to 2 ACKs per window (up to 93.2\% of candidates rejected), so channel-aware ranking keeps a steady advantage under severe scarcity (Fig.~\ref{fig:sim-quota}). The hardware (Table~\ref{tab:quota-hw}) and simulated quota sweeps use different traffic realizations and window definitions, so their rejection rates are not expected to match.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_sim_quota.pdf}
+\caption{Simulated ACK quota at $\Delta p=0.2$: delivery among sent ACKs; blue labels: SAF-LoRa gain over round-robin (pp); grey labels: rejected share.}
+\label{fig:sim-quota}
+\end{figure}
+
+\subsection{Gateway Scaling}
+\label{sec:gw-scaling}
+With 1--6 gateways (10 nodes, 200 rounds, 50 seeds; 1.5~dB interference and $-0.06$ delivery on gateway~1), we used two channel configurations (Fig.~\ref{fig:scaling}). In both, every link is an independent Gilbert--Elliott channel with the benchmark transitions, and the true ACK delivery probability is 0.75 (GOOD) or 0.25 (BAD) regardless of distance. In the \emph{flat} configuration every link also has the benchmark uplink loss (3\%/50\%). In the \emph{coverage} configuration, nodes are placed uniformly at random in a 1300~m $\times$ 1300~m area (re-drawn per seed), two gateways sit on the diagonal at 20\% and 80\% of the side and other counts are spaced evenly on a 390~m-radius ring around the centre, and the uplink loss probability of each link grows with node--gateway distance, from 4\%/51\% (GOOD/BAD) at the gateway to 58\%/81\% at 400~m and 88\%/97\% beyond about 800~m. The coverage configuration therefore makes the uplink observations sparse and uneven (69--75\% average loss per gateway) while the downlink is unchanged, a harder test for any uplink-based estimator. SNR-greedy is shown in two forms: with a lost uplink counted as the lowest reading, and with the last received reading.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig_scaling.pdf}
+\caption{Simulated ACK delivery vs.\ number of gateways (10 nodes, 200 rounds, 50 seeds, 1.5~dB interference on gateway~1). (a) Flat configuration. (b) Coverage configuration with distance-dependent uplink loss. With one gateway all policies coincide.}
+\label{fig:scaling}
+\end{figure*}
+
+With one gateway all policies coincide. From two to six gateways, SAF-LoRa leads both SNR-greedy variants at every gateway count in both configurations. In the flat configuration it rises from 71.78\% to 74.64\% and closes the gap to the oracle from 1.4~pp to 0.1~pp ($G_{\text{norm}}$ 0.83--0.99), ahead of SNR-greedy by 0.17--0.21~pp (paired 95\% CI $\le\pm0.04$~pp) and of last-reading SNR-greedy by 1.3--2.2~pp. In the coverage configuration it rises from 67.99\% to 73.35\%, ahead of SNR-greedy by 1.3--2.1~pp and of last-reading SNR-greedy by 0.5--4.0~pp (paired 95\% CIs $\le\pm0.21$~pp), because the HMM integrates CRC-failed and lost receptions across time rather than relying on a single reading. Random and round-robin plateau near 66.9\% in both configurations, so in these simulations the benefit of additional gateways is greatest for policies that can distinguish the gateways' channel conditions.
+
+\subsection{Blend Ablation: What the Fixed Weight Costs}
+\label{sec:sim-blend}
+Sections~\ref{sec:sim-extended}--\ref{sec:gw-scaling} evaluate the uplink-primed
+SAF-LoRa, which is the variant available before any receipt arrives. The confirmed-outcome hardware campaigns, by contrast, run the fixed blend of~\eqref{eq:blend}; only the interference-redirection runs of Section~\ref{sec:results-interference} use the uplink-primed variant. We therefore
+evaluated the blend, and the pure fixed-weight family
+$(1-w)\hat p_{n,g}+w\,\mathrm{EWMA}_{n,g}$ from which it is drawn, on the
+same paired worlds and decisions as the benchmark above (50 seeds).
+
+Delivery falls monotonically in $w$ at every asymmetry tested
+(Fig.~\ref{fig:blend}(a)): at $\Delta p=0.2$ it drops from 72.04\% at $w=0$
+(belief only) to 65.24\% at $w=1$ (EWMA only), and the fixed rule
+$w=n/(n+5)$ lands at 67.34\%. Across the severity sweep the blend sits strictly
+between its two components at every point (Fig.~\ref{fig:blend}(b),(c)): it trails the
+belief by $2.63$--$4.01$~pp and leads the EWMA by $1.35$--$1.94$~pp, and every one of
+these paired 95\% CIs excludes zero. Its oracle-gap recovery is correspondingly
+$G_\text{norm}=0.37$--$0.64$ against $0.82$--$0.99$ for the belief. The blend is
+therefore not a free improvement on either signal: it is a compromise whose position
+is set by $w$.
+
+\emph{The component ordering depends on uplink--downlink coupling.} In this benchmark
+the downlink state equals the uplink state, so the HMM belief is an exact proxy and
+confirmed outcomes can only add noise; the belief consequently dominates. The hardware
+ablation of Section~\ref{sec:sessions} shows the opposite ordering, with the EWMA
+ahead of the belief, which is what the mismatch experiment of
+Section~\ref{sec:sim-robust} reproduces as the coupling $\rho$ falls: at $\rho=1$
+adaptive fusion tracks the belief and at $\rho=0$ it tracks the EWMA. Taken together, the simulation and hardware results illustrate two operating regimes rather than directly contradicting one another: neither
+component is universally better, and a weight fixed in advance cannot be right in both.
+This is the case for replacing $w$ with a weight driven by observed predictive
+accuracy, which is what Section~\ref{sec:sim-robust} evaluates.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig_blend.pdf}
+\caption{Blend ablation on the paired simulation worlds (50 seeds). (a) Delivery
+against the fixed EWMA weight $w$ for three gateway asymmetries; dotted lines
+mark the paper's rule $w=n/(n+5)$. (b) Delivery against interference severity for the
+blend and its two components, with the oracle and round-robin for reference.
+(c) Paired differences of the blend against each component with 95\% CIs; the blend
+lies strictly between them at every severity.}
+\label{fig:blend}
+\end{figure*}
+
+\subsection{Adaptive SAF-LoRa With Confirmed Outcomes}
+\label{sec:sim-robust}
+This experiment evaluates the confirmed-outcome extension of SAF-LoRa; it is not used in the main benchmark above. Adaptive SAF-LoRa replaces the fixed weight of~\eqref{eq:blend} with Bayesian model averaging of two delivery predictors: a \emph{predictive belief} that propagates the last belief over its age $a$ toward the link's long-run mean $m$, $\hat b=m+\lambda^{a}(b-m)$ with $\lambda=P(\text{G}\to\text{G})+P(\text{B}\to\text{B})-1=0.45$ (mapped to $0.25+0.5\hat b$), and the EWMA of confirmed outcomes. Each predictor is weighted by its likelihood on confirmed ACK outcomes (forgetting factor 0.98). This experiment uses the same delivery and observation framework, but a separate channel-state realization with the HMM transition probabilities ($P(\text{G}\!\to\!\text{G})=0.85$, $P(\text{B}\!\to\!\text{B})=0.60$) for its channel-state process, so its stationary GOOD probability is 0.727 rather than the 0.857 of the main benchmark; and a lost or CRC-failed uplink counts as a very low reading for SNR-greedy.
+
+\textit{Uplink--downlink mismatch.} The downlink state equals the uplink state with probability $\rho$ and follows an independent chain otherwise (Fig.~\ref{fig:sim-mismatch}, the only part of this study shown graphically). At $\rho=1$, adaptive fusion matches the belief ($+0.45$~pp over SNR-greedy, $+9.6$~pp over EWMA, $+6.2$~pp over the fixed blend); at $\rho=0$ it matches the EWMA. When uplink and downlink degrade opposite gateways, uplink-only policies pick the wrong gateway, while adaptive fusion follows the confirmed outcomes and beats SNR-greedy by up to $+5.0\pm0.4$~pp. The hardware ablations of Section~\ref{sec:sessions} show that confirmed ACK outcomes provide a useful complementary signal in the evaluated sessions; this experiment examines how the relative weight of the uplink belief and the confirmed outcomes should change across channel conditions.
+
+\textit{Stale, sparse and lost information.} With the uplink delayed by $\tau\ge1$ rounds, the predictive belief leads SNR-greedy by $+1.7$ to $+3.2$~pp; when nodes transmit in only 10--50\% of rounds it leads by $+1.2$ to $+1.5$~pp. Randomly missing receipt reports leave delivery essentially unchanged. Across a 75-cell parameter sweep ($\rho\in\{1,0.75,0.5,0.25,0\}$, $\tau\in\{0,1,2,4,8\}$, report loss $L\in\{0,0.2,0.5\}$, 20 seeds per cell), adaptive fusion is never more than 0.27~pp below the better of SNR-greedy and EWMA, is ahead of both by $+0.98$ to $+2.58$~pp whenever the uplink is stale, and moves by at most 0.52~pp when half the reports are lost.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{e10_mismatch.png}
+\caption{Adaptive SAF-LoRa (confirmed-outcome extension): simulated ACK delivery vs.\ uplink--downlink coupling $\rho$ ($\Delta p=0.2$, 50 paired seeds). Adaptive fusion tracks the belief when the uplink predicts the downlink and the EWMA when it does not.}
+\label{fig:sim-mismatch}
+\end{figure}
+
+\section{Discussion and Limitations}
+\label{sec:limitations}
+The hardware experiments validate the gateway-union mechanism, HMM-based state tracking with ACK redirection, and the piggybacked receipt mechanism (confirmed outcomes for more than 97\% of ACKs without an additional uplink packet), while adaptive fusion is evaluated in simulation. \emph{Experimental scope.} The hardware policy comparisons rest on two to twelve paired blocks per contrast, so the delivery differences in Fig.~\ref{fig:campaign}, Table~\ref{tab:sessions}, Fig.~\ref{fig:paired} and Fig.~\ref{fig:geom2} are descriptive and not statistically established, and the gateway-diversity figures come from one run per configuration. \emph{Physical scope.} In our geometry the interferer also affected reception at the nodes, which bounds what gateway selection can recover, and the ON-state delivery is partly confounded with report loss. Delivery is computed over reported ACKs, so report loss that correlates with failure would overstate absolute levels (by about 6~pp in simulation) but not comparisons with equal report loss across policies. \emph{Deployment scope.} The simulation benchmark evaluates the uplink-primed SAF-LoRa, while the confirmed-outcome hardware campaigns run the fixed blend of~\eqref{eq:blend}; the two are not interchangeable, and Section~\ref{sec:sim-blend} reports the blend separately. Adaptive fusion has been evaluated only in simulation, whose oracle-gap recovery assumes a stronger uplink--downlink coupling than measured on hardware. Receipt reports are not yet authenticated, and the 4.2~s receive window per telegram has not been optimized.
+
+\section{Conclusion}
+SAF-LoRa moves link-state awareness from duplicate-fragment selection, where under hard-decision reception it provably cannot improve availability, to downlink ACK scheduling, where it can, and, through its confirmed-outcome extension, closes the feedback loop with a piggybacked ACK-receipt mechanism that requires no additional uplink packet. On a ten-node commodity testbed, the gateway union added 0.0--6.1~pp of reconstructed telegrams (mean 2.9~pp), most where one gateway was interfered; SAF-LoRa shifted ACK assignment toward the gateway not directly exposed to the interferer, raising its mean ACK gateway-selection share from 50.6\% to 57.2\% across three interference runs, every run above the 50.6\% baseline; in the confirmed-outcome campaigns SAF-LoRa-F shifted ACKs toward the gateway favored by the confirmed-outcome history although the resulting delivery differences varied across sessions; the HMM followed interferer onset within a median of 2.9--6.9~s and achieved AUC 0.666 for confirmed ACK delivery on the 3{,}514 reported ACKs of the eight-block campaign; and receipt reports arrived for more than 97\% of ACKs at 2.4--3.0\% ACK airtime, with reconstruction unaffected by the ACK policy. Ablating the two terms of the scheduler shows where the information lies: in session~B belief-only was below both EWMA and SAF-LoRa-F, while the confirmed-outcome term alone achieved the highest observed delivery in the hardware sessions in which it ran, which is why the blending weight rather than the signals is the natural target for the adaptive extension. Simulation sharpens this: on paired worlds the fixed blend lies strictly between its two components at every severity, trailing the belief by 2.6--4.0~pp and leading the EWMA by 1.4--1.9~pp, and the component ordering itself reverses with the uplink--downlink coupling, so no weight fixed in advance is right in both regimes. In a second gateway geometry a pre-specified twelve-block campaign confirmed the selection mechanism directly: every state-aware policy redirected ACKs toward the healthier gateway, to differing degrees, and the measured delivery gains agreed with the gain model of~\eqref{eq:deltaR} to within 1.3~pp. In simulation the uplink-primed SAF-LoRa recovers 82--99.5\% of the oracle gap, has higher mean delivery than SNR-greedy through 2~dB and at every gateway count from two to six in both channel configurations, follows the predicted asymmetry slope to within 5\%, and, with adaptive fusion, stays within 0.27~pp of the better of SNR-greedy and EWMA across 75 parameter combinations. Next steps are adaptive fusion on hardware, a larger block-randomized campaign in a deliberately gateway-asymmetric geometry, and authenticated receipt reports.
+
+\bibliographystyle{IEEEtran}
+ \bibliography{sample}
+
+\begin{thebibliography}{99}
+
+
+\bibitem{convlora2026}
+T. Hong, L. Xu, X. Yu, J. Shen, and G. Zhang, ``ConvLoRa: Convolutional neural
+network-based collision demodulation for LoRa uplinks in LEO-IoT,''
+\emph{Sensors}, vol.~26, no.~6, p.~1919, 2026.
+
+
+\bibitem{canas2026}
+S. Yu, Z. Zhang, X. Xia, Y. Zheng, and J. Wang, ``Resolving inter-logical channel interference for large-scale LoRa deployments,'' \emph{IEEE Trans. Mobile Comput.}, vol.\ 25, no.\ 2, pp.\ 2759--2773, 2026.
+
+
+\bibitem{yang2025}
+H. Yang, ``Optimizing multi-gateway LoRaWAN via cloud-edge collaboration and
+knowledge distillation,'' arXiv:2504.13194, Apr. 2025.
+
+
+\bibitem{ts2025}
+S. Lahoud and K. Khawam, ``Fragment-level macro-diversity reception in LoRaWAN networks with LR-FHSS,'' in \emph{Proc. IEEE GLOBECOM}, 2025, doi: 10.1109/GLOBECOM59602.2025.11432594.
+
+
+\bibitem{ferhi2025}
+L. Aissaoui Ferhi, ``Offline learning for acknowledgment optimization in massive LoRaWAN networks,'' \emph{Internet Technol. Lett.}, vol.\ 8, no.\ 6, p.\ e70172, 2025, doi: 10.1002/itl2.70172.
+
+
+\bibitem{fdlora2025}
+S. Yu, X. Xia, Z. Zhang, N. Hou, and Y. Zheng, ``FDLoRa: Scaling downlink concurrent transmissions with full-duplex LoRa gateways,'' \emph{IEEE Trans. Mobile Comput.}, vol.\ 24, no.\ 10, pp.\ 10668--10682, Oct. 2025, doi: 10.1109/TMC.2025.3572130.
+
+
+\bibitem{loraseek2025}
+K. Nguyen, Y. Ren, J. Du, J. Lin, M. Gan, S. Chen, M. Zhang, C. Peng, and
+Z. Cao, ``LoRaSeek: Boosting denoising ability in neural-enhanced LoRa decoder
+via hierarchical feature extraction,'' in \emph{Proc. ACM MobiCom}, Hong Kong,
+China, 2025, pp. 712--726.
+
+
+\bibitem{b2lora2025}
+Y. Zhao, W. Wang, X. Wang, L. Kong, J. Yu, Y. Zhu, S. Li, C. He, and G. Chen,
+``B2LoRa: Boosting LoRa transmission for satellite-IoT systems with blind
+coherent combining,'' in \emph{Proc. ACM MobiCom}, Hong Kong, China, 2025,
+pp. 108--122.
+
+
+\bibitem{caillouet2024}
+C. Caillouet, A. Guitton, O. Iova, and F. Valois, ``The impact of downlink
+scheduling policy on the capacity of LoRaWAN,'' in \emph{Proc. IEEE GLOBECOM},
+Cape Town, South Africa, Dec. 2024.
+
+
+\bibitem{xgate2024}
+S. Yu, X. Xia, N. Hou, Y. Zheng, and T. Gu, ``Revolutionizing LoRa gateway with
+XGate: Scalable concurrent transmission across massive logical channels,'' in
+\emph{Proc. ACM MobiCom}, Washington, DC, USA, 2024, pp. 482--496.
+
+
+\bibitem{mojamed2023}
+M. Al Mojamed, ``A duty cycle-based gateway selection algorithm for LoRaWAN downlink communication,'' \emph{Comput. Syst. Sci. Eng.}, vol.\ 45, no.\ 3, pp.\ 2953--2970, 2023, doi: 10.32604/csse.2023.032965.
+
+
+\bibitem{srlora2023}
+J. Du, Y. Ren, Z. Zhu, C. Li, Z. Cao, Q. Ma, and Y. Liu, ``SRLoRa: Neural-enhanced LoRa weak signal decoding with multi-gateway super resolution,'' in \emph{Proc. ACM MobiHoc}, 2023, pp.\ 270--279.
+
+
+\bibitem{gw2023energy}
+A. Loubany, S. Lahoud, A. E. Samhat, and M. El Helou, ``Improving energy efficiency in LoRaWAN networks with multiple gateways,'' \emph{Sensors}, vol.\ 23, no.\ 11, p.\ 5315, 2023.
+
+
+\bibitem{gw2023throughput}
+A. Loubany, S. Lahoud, A. E. Samhat, and M. El Helou, ``Joint throughput-energy optimization in multi-gateway LoRaWAN networks,'' \emph{Telecommun. Syst.}, vol.\ 84, pp.\ 271--283, 2023.
+
+
+\bibitem{mclora2023}
+F. Yu, X. Zheng, L. Liu, and H. Ma, ``Enabling concurrency for non-orthogonal LoRa channels,'' in \emph{Proc. ACM MobiCom}, 2023, pp.\ 1--15.
+
+
+\bibitem{gw2022}
+A. Petroni and M. Biagi, ``Interference mitigation and decoding through gateway diversity in LoRaWAN,'' \emph{IEEE Trans. Wireless Commun.}, vol.\ 21, no.\ 11, pp.\ 9068--9081, 2022.
+
+
+\bibitem{todoli2021}
+D. Todoli-Ferrandis, J. Silvestre-Blanes, and V. Sempere-Paya, ``Robust downlink mechanism for industrial Internet of Things using LoRaWAN networks,'' \emph{Electronics}, vol.\ 10, art.\ no.\ 2122, 2021.
+
+
+\bibitem{gw2021dist}
+B. Citoni, S. Ansari, Q. H. Abbasi, M. A. Imran, and S. Hussain, ``Impact of inter-gateway distance on LoRaWAN performance,'' \emph{Electronics}, vol.\ 10, no.\ 18, p.\ 2197, 2021.
+
+
+\bibitem{pcube2021}
+X. Xia, N. Hou, and Y. Zheng, ``PCube: Scaling LoRa concurrent transmissions with reception diversities,'' in \emph{Proc. ACM MobiCom}, 2021.
+
+
+\bibitem{nelora2021}
+C. Li, H. Guo, S. Tong, X. Zeng, Z. Cao, M. Zhang, Q. Yan, L. Xiao, J. Wang, and Y. Liu, ``NELoRa: Towards ultra-low SNR LoRa communication with neural-enhanced demodulation,'' in \emph{Proc. ACM SenSys}, 2021.
+
+
+\bibitem{sic2021sigcomm}
+M. O. Shahid, M. Philipose, K. Chintalapudi, S. Banerjee, and B. Krishnaswamy, ``Concurrent interference cancellation: Decoding multi-packet collisions in LoRa,'' in \emph{Proc. ACM SIGCOMM}, 2021, pp.\ 503--515.
+
+
+\bibitem{lora_alliance_spec}
+LoRa Alliance, ``LoRaWAN L2 1.0.4 specification,'' LoRa Alliance Technical Committee, 2020.
+
+
+\bibitem{yu2025fdlora}
+S.~Yu, X.~Xia, Z.~Zhang, N.~Hou, and Y.~Zheng, 
+``{FDLoRa}: Scaling downlink concurrent transmissions with full-duplex LoRa gateways,'' 
+\emph{IEEE Transactions on Mobile Computing}, vol.~24, no.~10, pp. 10668--10682, 2025, doi: 10.1109/TMC.2025.3572130.
+
+\bibitem{yu2026canas}
+S.~Yu, Z.~Zhang, X.~Xia, Y.~Zheng, and J.~Wang, 
+``Resolving inter-logical channel interference for large-scale LoRa deployments,'' 
+\emph{IEEE Transactions on Mobile Computing}, vol.~25, no.~2, pp. 2759--2773, 2026, doi: 10.1109/TMC.2025.3609316.
+
+\bibitem{lodhi2026edgesense}
+M.~A. Lodhi, X.~Sun, K.~Mahmood, and A.~Lodhi, 
+``{EdgeSense}: A hybrid TinyML and deep learning framework for SNR-aware adaptive data rate in LoRaWAN,'' 
+\emph{IEEE Transactions on Mobile Computing}, vol.~25, no.~10, pp. 17535--17546, 2026, doi: 10.1109/TMC.2026.3695916.
+
+\end{thebibliography}
+
+\end{document}
