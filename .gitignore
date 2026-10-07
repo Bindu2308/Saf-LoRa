@@ -37,3 +37,4 @@ paper/*.out
 paper/*.bbl
 paper/*.blg
 paper/*.synctex.gz
+main_synchk*
